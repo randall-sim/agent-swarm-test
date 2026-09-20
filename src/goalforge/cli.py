@@ -59,6 +59,11 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--runs-dir", type=Path, default=None)
     ls = sub.add_parser("list", help="List saved runs")
     ls.add_argument("--runs-dir", type=Path, default=None)
+    web = sub.add_parser("serve", help="Open the local web UI for goals and live agent activity")
+    web.add_argument("repo", nargs="?", type=Path, default=Path.cwd())
+    web.add_argument("--runs-dir", type=Path, default=None)
+    web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--no-open", action="store_true", help="Print the URL without opening a browser")
     for command in sub.choices.values():
         command.add_argument("--env-file", type=Path,
                              help="Configuration file (default: .env in the current directory)")
@@ -94,6 +99,9 @@ def main(argv: list[str] | None = None) -> int:
         config = settings(args.env_file)
         if args.runs_dir is None:
             args.runs_dir = Path(config.get("GOALFORGE_HOME") or str(Path.home() / ".goalforge")) / "runs"
+        if args.command == "serve":
+            from .web import serve
+            return serve(args.repo, args.runs_dir, config, args.port, not args.no_open)
         if args.command == "list":
             for path in sorted(args.runs_dir.glob("*/state.json")):
                 state = json.loads(path.read_text(encoding="utf-8"))

@@ -1,6 +1,6 @@
 # GoalForge
 
-A small Python CLI coding agent inspired by **RecEvolve**. Give it a coding goal, a repository, verification commands, and an LLM API key. It inspects code, proposes a change, critiques the plan, edits files, runs checks, and reviews the result. Useful changes accumulate on a separate Git branch.
+A small Python coding agent with a CLI and local web UI, inspired by **RecEvolve**. Give it a coding goal, a repository, verification commands, and an LLM API key. It inspects code, proposes a change, critiques the plan, edits files, runs checks, and reviews the result. Useful changes accumulate on a separate Git branch.
 
 Use it for bug fixes, small features, refactoring, tests, and documentation. It is a working starter implementation, not a reproduction of the paper's production infrastructure or a claim of equivalent results.
 
@@ -31,6 +31,33 @@ goalforge --help
 ```
 
 If activation is unavailable, invoke `.venv\Scripts\python.exe -m goalforge` after installing with that same Python. You can also run without installation by adding `src` to `PYTHONPATH` and using `python -m goalforge`.
+
+## Local web UI
+
+Launch GoalForge from its installed environment:
+
+```bash
+source .venv/bin/activate
+goalforge serve /path/to/your/project
+```
+
+Or, without activating the environment, run `.venv/bin/python -m goalforge serve /path/to/your/project` from the GoalForge directory. The server opens your browser and prints its local URL. Use `--no-open` to copy the URL yourself, or `--port 8766` if the default port is busy. In WSL, paste the printed URL into your Windows browser if automatic opening is unavailable.
+
+The server reads `.env` from the directory where you launch it. To launch from elsewhere, pass `--env-file /path/to/goalforge/.env`. Your API key stays on the Python server; the browser receives only a flag indicating whether it is configured. Restart the server after editing `.env`.
+
+The UI provides:
+
+- **New goal:** choose a local folder using Browse, enter instructions and required verification commands, select the model, and set the worker count, request budget, and attempt limit. Commands use argument syntax, not shell pipelines. Use an absolute Python executable path when the target project needs its own virtual environment.
+- **Live activity:** updates every second from the persisted event log. Agent cards show current activity; select an agent to filter the timeline. Click an action to see its tool arguments and result, task assignment, or stated decision. These are observable actions and explicit summaries, not private model reasoning.
+- **Approvals:** approve or deny each model-requested terminal command in the browser. Your configured verification commands run automatically when you start the goal. Commands execute with your local account's permissions; worktrees are not a sandbox.
+- **Review:** inspect planner/critic/reviewer decisions, browse the integrated workspace files, and view changes relative to the starting commit. During parallel coding, worker edits remain in separate worktrees until integration; inspect `write_file`/`replace_text` actions to see those edits live.
+- **Pause and continue:** pause waits for in-flight API requests or commands to finish (bounded by their timeouts), then discards unaccepted work and retains reviewed commits. Resume with a new budget, or add follow-up instructions in the UI. Pause first before changing instructions. Closing the browser does not stop the agents; Ctrl-C in the server terminal requests a pause and waits for cleanup.
+- **Apply to original folder:** after reviewing accepted changes, explicitly confirm a fast-forward into the original repository's current branch. The original folder must be clean and its branch must support that fast-forward; conflicts or divergent history are left for you to resolve. No automatic push occurs.
+- **Saved runs:** reopen earlier CLI or UI runs from the sidebar, including their original event history. Reopening the page reconstructs the timeline from disk.
+
+The target must be a Git repository with a committed HEAD and clean working tree. Keep run storage outside the repository. The server executes one goal at a time, with up to eight parallel coding workers within that goal; it reuses the CLI engine, checks, protected-path rules, request budget, and isolated worktrees.
+
+This is a local single-user interface: it binds only to `127.0.0.1`, requires a random session token for its API, and rejects foreign Host/Origin requests. Open the full URL printed by the server; the token is stored for that browser tab and removed from the address bar. It is not designed for public hosting or team authentication. Files and log text render as text, not executable HTML. No frontend build step or third-party Python runtime dependency is required.
 
 ## Configure your LLM
 

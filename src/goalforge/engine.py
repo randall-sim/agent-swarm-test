@@ -145,7 +145,7 @@ class Engine:
 
         for _ in range(self.steps):
             if self.cancelled.is_set():
-                raise WorkerCancelled("Parallel attempt cancelled")
+                raise WorkerCancelled("Paused by user")
             try:
                 reply = self.client.complete(messages, tools=schema)
             except ProviderError as exc:
@@ -154,7 +154,7 @@ class Engine:
                 reject("The response could not be parsed as a JSON object")
                 continue
             if self.cancelled.is_set():
-                raise WorkerCancelled("Parallel attempt cancelled")
+                raise WorkerCancelled("Paused by user")
             self.store.event("role_reply", agent_id=label, role=name,
                              attempt=context.get("attempt"), reply=reply)
             try:
@@ -192,6 +192,9 @@ class Engine:
         results = []
         for argv in state["checks"]:
             self.emit("  check: " + json.dumps(argv))
+            if self.cancelled.is_set():
+                raise WorkerCancelled("Paused by user")
+            self.store.event("check_started", argv=argv, attempt=state["attempt"])
             result = run_process(argv, self.workspace.root, self.workspace.timeout, self.workspace.secret)
             self.store.event("check", result=result)
             results.append(result)
@@ -256,7 +259,7 @@ class Engine:
                     state["status"] = "budget_exhausted"
             except (KeyboardInterrupt, Exception) as exc:
                 # Persist failed execution as knowledge; never retain unreviewed edits.
-                state["status"] = "paused" if isinstance(exc, KeyboardInterrupt) else "error"
+                state["status"] = "paused" if isinstance(exc, (KeyboardInterrupt, WorkerCancelled)) else "error"
                 if isinstance(exc, BudgetExceeded):
                     state["status"] = "budget_exhausted"
                 error = str(exc) or "Interrupted by user"
@@ -285,6 +288,8 @@ class Engine:
                 return
         else:
             item["implementation"] = self.role("coder", context)
+        if self.cancelled.is_set():
+            raise WorkerCancelled("Paused by user")
         root = self.workspace.root
         if git(root, "rev-parse", "HEAD") != state["accepted_commit"]:
             raise RuntimeError("The coding command changed Git HEAD; stopping and restoring the checkpoint.")

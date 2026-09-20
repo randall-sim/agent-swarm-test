@@ -159,6 +159,8 @@ def implement_parallel(engine: Engine, state: dict, context: dict, item: dict) -
         futures = [pool.submit(code, entry) for entry in prepared]
         pending = set(futures)
         while pending:
+            if engine.cancelled.is_set():
+                raise WorkerCancelled("Paused by user")
             # Keep interactive approvals on the main thread, including Ctrl-C handling.
             try:
                 agent_id, argv, done, answer = approvals.get_nowait()
@@ -184,7 +186,7 @@ def implement_parallel(engine: Engine, state: dict, context: dict, item: dict) -
         item["implementation"] = {"summary": "\n".join(f"{r['agent_id']}: {r['summary']}" for r in reports)}
         engine.store.event("integration", attempt=state["attempt"], workers=reports)
         return True
-    except (BudgetExceeded, ProviderError):
+    except (BudgetExceeded, ProviderError, WorkerCancelled):
         raise
     except Exception as exc:
         item.update(outcome="reverted", workers=reports, lesson=f"Parallel attempt rejected: {exc}")

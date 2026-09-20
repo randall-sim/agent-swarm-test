@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GoalForge · Local workspace</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="mark">G</span> GoalForge <small>LOCAL</small>
+      </div>
+      <button id="new" class="primary">＋ New goal</button>
+      <div class="section-label">WORKSPACE RUNS</div>
+      <nav id="runs" aria-label="Saved runs"></nav>
+      <footer>
+        <span class="dot"></span> Local execution · Your API key<br /><span
+          id="connection"
+          >Connecting…</span
+        >
+      </footer>
+    </aside>
+    <main>
+      <header>
+        <div>
+          <div class="eyebrow">AGENT WORKSPACE</div>
+          <h1 id="title">What should we build?</h1>
+        </div>
+        <span id="status" class="badge">Ready</span>
+      </header>
+      <div id="error" role="alert" hidden></div>
+      <section id="composer">
+        <p class="muted">
+          Give your agents a goal. Watch the plan become tested code.
+        </p>
+        <form id="goal-form">
+          <label
+            >Project folder
+            <div class="row">
+              <input
+                id="repo"
+                required
+                placeholder="/home/you/dev/project"
+              /><button id="browse" type="button">Browse</button>
+            </div></label
+          >
+          <label
+            >Goal<textarea
+              id="goal"
+              rows="4"
+              required
+              placeholder="Describe what you want to build, fix, or improve…"
+            ></textarea>
+          </label>
+          <label
+            >Verification commands
+            <small>One command per line; these run automatically.</small
+            ><textarea
+              id="checks"
+              rows="2"
+              required
+              placeholder="python -m unittest discover -s tests -v"
+            ></textarea>
+          </label>
+          <div class="grid">
+            <label>Model<input id="model" required /></label
+            ><label
+              >Coding workers<input
+                id="workers"
+                type="number"
+                min="1"
+                max="8"
+                value="3" /></label
+            ><label
+              >Request budget<input
+                id="max-calls"
+                type="number"
+                min="1"
+                max="10000"
+                value="80" /></label
+            ><label
+              >Attempts<input
+                id="iterations"
+                type="number"
+                min="1"
+                max="100"
+                value="5"
+            /></label>
+          </div>
+          <details>
+            <summary>Instructions & constraints</summary>
+            <label
+              >Project instructions<textarea
+                id="instructions"
+                rows="3"
+                placeholder="Conventions, constraints, and context for the agents"
+              ></textarea></label
+            ><label
+              >Protected paths <small>One relative path or glob per line</small
+              ><textarea
+                id="protected"
+                rows="2"
+                placeholder="tests/**"
+              ></textarea>
+            </label>
+          </details>
+          <p class="muted small">
+            Start from a committed Git repository. Changes stay in an isolated
+            workspace. Model-requested commands need your approval here.
+          </p>
+          <button class="primary" id="start">Start agents ↗</button>
+        </form>
+      </section>
+      <section id="run-view" hidden>
+        <div class="run-meta" id="meta"></div>
+        <div class="toolbar">
+          <button id="pause">Pause run</button
+          ><button id="show-diff">View changes</button
+          ><button id="show-files">Browse files</button
+          ><button id="show-history">Decisions</button
+          ><button id="integrate">Apply to original folder</button>
+        </div>
+        <div id="approvals"></div>
+        <div id="agents" class="agents"></div>
+        <div class="timeline-heading">
+          <h2>Activity</h2>
+          <select id="filter" aria-label="Filter by agent">
+            <option value="">All agents</option>
+          </select>
+        </div>
+        <div id="timeline"></div>
+        <form id="followup-form">
+          <label
+            >Continue this goal<textarea
+              id="followup"
+              rows="2"
+              placeholder="Add follow-up instructions, or leave blank to resume a paused run"
+            ></textarea>
+          </label>
+          <p class="muted small">
+            Uses the worker count and budgets below. Pause an active run before
+            sending instructions.
+          </p>
+          <div class="grid">
+            <label
+              >Workers<input
+                id="resume-workers"
+                type="number"
+                min="1"
+                max="8"
+                value="3" /></label
+            ><label
+              >Requests<input
+                id="resume-calls"
+                type="number"
+                min="1"
+                max="10000"
+                value="80" /></label
+            ><label
+              >Attempts<input
+                id="resume-iterations"
+                type="number"
+                min="1"
+                max="100"
+                value="5"
+            /></label>
+          </div>
+          <button id="resume" class="primary">Send / resume</button>
+        </form>
+      </section>
+    </main>
+    <aside class="inspector">
+      <div class="inspector-heading">
+        <h2 id="detail-title">Inside the swarm</h2>
+        <span>↗</span>
+      </div>
+      <div id="detail">
+        <div class="empty">
+          <div class="orb">◈</div>
+          <h3>Every action, in context</h3>
+          <p>
+            Select an agent or an activity to inspect assignments, tool
+            arguments, results, and decisions.
+          </p>
+          <p class="small">
+            Planner → Critic → Parallel workers → Checks → Reviewer
+          </p>
+        </div>
+      </div>
+    </aside>
+    <dialog id="folder-dialog">
+      <h2>Open a local folder</h2>
+      <div class="row">
+        <input id="folder-path" aria-label="Folder path" /><button
+          id="folder-go"
+        >
+          Go
+        </button>
+      </div>
+      <div id="folder-list"></div>
+      <div class="row">
+        <button id="folder-up">↑ Parent</button
+        ><button id="folder-cancel">Cancel</button
+        ><button id="folder-select" class="primary">Use this folder</button>
+      </div>
+    </dialog>
+  </body>
+</html>
