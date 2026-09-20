@@ -475,3 +475,148 @@ dialog::backdrop {
     font-size: 21px;
   }
 }
+
+/* A fork/join graph of the latest attempt. Width expands to fit up to eight workers. */
+.agents {
+  display: block;
+}
+.graph-heading {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+.graph-heading strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+.parallel-badge {
+  color: var(--accent);
+  font-size: 11px;
+}
+.graph-scroll {
+  overflow-x: auto;
+  padding-bottom: 8px;
+}
+.graph-canvas {
+  position: relative;
+  height: 530px;
+  margin: auto;
+}
+.graph-canvas svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.flow-edge {
+  fill: none;
+  stroke: #53665b;
+  stroke-width: 1.7;
+}
+.flow-edge.live {
+  stroke: var(--accent);
+  stroke-dasharray: 6 4;
+  animation: flow 1s linear infinite;
+}
+.graph-node {
+  position: absolute;
+  width: 136px;
+  height: 58px;
+  padding: 7px 8px;
+  text-align: center;
+  background: #202629;
+  border: 1px solid #414a50;
+}
+.graph-node strong,
+.graph-node small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.graph-node strong {
+  font-size: 12px;
+}
+.graph-node small {
+  font-size: 10px;
+  color: var(--muted);
+}
+.graph-node.done {
+  border-color: #537760;
+}
+.graph-node.working {
+  border-color: var(--accent);
+  box-shadow: 0 0 16px #a9edbe20;
+}
+.graph-node.working small {
+  color: var(--accent);
+}
+.graph-node.failed {
+  border-color: #d08080;
+}
+@keyframes flow {
+  to {
+    stroke-dashoffset: -20;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .flow-edge.live {
+    animation: none;
+  }
+}
+
+.readable-field {
+  margin: 12px 0;
+}
+.readable-field h4 {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0 0 5px;
+  font-weight: 500;
+}
+.readable-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 6px 0;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.readable-object {
+  border-left: 2px solid #3b5143;
+  padding-left: 12px;
+  margin: 12px 0;
+}
+.readable-list > .readable-object {
+  background: #1c2220;
+  padding: 8px 12px;
+  border-radius: 5px;
+}
+.decision-pill {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 12px;
+  font-size: 12px;
+  background: #303438;
+}
+.decision-pill.yes {
+  color: #a9edbe;
+  background: #253b2e;
+}
+.decision-pill.no {
+  color: #edb5a9;
+  background: #3b2d25;
+}
+.diff-add {
+  color: #a9edbe;
+}
+.diff-remove {
+  color: #f0a2a2;
+}
+.worker-diff {
+  margin-top: 16px;
+  width: 100%;
+  border-color: #537760;
+}

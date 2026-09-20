@@ -45,6 +45,96 @@ function button(text, action, className) {
   b.onclick = () => Promise.resolve().then(action).catch(error);
   return b;
 }
+function humanLabel(name) {
+  const labels = {
+    approach: "Approach",
+    acceptance: "Success criteria",
+    approved: "Plan approved",
+    accept: "Changes accepted",
+    complete: "Goal complete",
+    reason: "Why",
+    lesson: "Next steps / lessons",
+    summary: "Implementation summary",
+    files: "Assigned files",
+    paths: "Changed files",
+    argv: "Command",
+    returncode: "Exit code",
+    timed_out: "Timed out",
+    content: "File contents",
+    old: "Before",
+    new: "After",
+    text: "Output",
+    input_tokens: "Input tokens",
+    output_tokens: "Output tokens",
+  };
+  return (
+    labels[name] ||
+    name.replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase())
+  );
+}
+function readable(value, key = "") {
+  if (value === null || value === undefined)
+    return node("p", "Not recorded", "muted");
+  if (typeof value === "boolean")
+    return node(
+      "span",
+      value ? "Yes" : "No",
+      "decision-pill " + (value ? "yes" : "no"),
+    );
+  if (Array.isArray(value)) {
+    if (key === "argv")
+      return node(
+        "pre",
+        value.map((v) => (/\s/.test(v) ? '"' + v + '"' : v)).join(" "),
+      );
+    const list = node("div", undefined, "readable-list");
+    for (const item of value) list.append(readable(item, key));
+    if (!value.length) list.append(node("p", "None", "muted"));
+    return list;
+  }
+  if (typeof value === "object") {
+    const box = node("div", undefined, "readable-object");
+    for (const [k, v] of Object.entries(value)) {
+      if (k.startsWith("_native") || ["signature", "patch"].includes(k))
+        continue;
+      const field = node("div", undefined, "readable-field");
+      field.append(node("h4", humanLabel(k)), readable(v, k));
+      box.append(field);
+    }
+    return box;
+  }
+  if (
+    [
+      "content",
+      "old",
+      "new",
+      "output",
+      "text",
+      "diff",
+      "Contents",
+      "Diff from starting commit",
+      "Worker patch",
+    ].includes(key)
+  ) {
+    const pre = node("pre");
+    if (key.toLowerCase().includes("diff") || key === "Worker patch") {
+      for (const line of String(value).split("\n"))
+        pre.append(
+          node(
+            "span",
+            line + "\n",
+            line.startsWith("+")
+              ? "diff-add"
+              : line.startsWith("-")
+                ? "diff-remove"
+                : "diff-context",
+          ),
+        );
+    } else pre.textContent = String(value);
+    return pre;
+  }
+  return node("p", String(value), "readable-text");
+}
 function inspect(title, sections) {
   const signature = JSON.stringify([title, sections]);
   if (signature === inspectorSignature) return;
@@ -54,14 +144,115 @@ function inspect(title, sections) {
   for (const [name, value] of Object.entries(sections)) {
     if (value === undefined) continue;
     const section = node("section", undefined, "detail-section");
-    section.append(
-      node("h3", name),
-      node(
-        "pre",
-        typeof value === "string" ? value : JSON.stringify(value, null, 2),
-      ),
-    );
+    section.append(node("h3", name), readable(value, name));
     $("detail").append(section);
+  }
+}
+let selectedAgent = null;
+function inspectAgent(id, title, trace, status, detail) {
+  const matching = trace.filter((e) => e.agent_id === id);
+  const final = matching.findLast((e) => e.reply?.final)?.reply.final;
+  const report = matching.findLast((e) => e.kind === "worker_finished");
+  const task =
+    matching.find((e) => e.kind === "worker_started")?.task ||
+    detail?.Assignment;
+  const sections = { Status: status };
+  if (task) {
+    sections.Assignment = task.title;
+    sections["Planned approach"] = task.approach;
+    sections["Success criteria"] = task.acceptance;
+    sections["Assigned files"] = task.files;
+  }
+  if (final) {
+    if (id === "planner") {
+      sections.Plan = final.title;
+      sections.Approach = final.approach;
+      sections["Success criteria"] = final.acceptance;
+      sections["Delegated tasks"] = final.tasks;
+    } else if (id === "critic") {
+      sections.Decision = final.approved
+        ? "Approved the plan"
+        : "Rejected the plan";
+      sections["Why this decision"] = final.reason;
+    } else if (id === "reviewer") {
+      sections.Decision = final.accept
+        ? "Accepted the changes"
+        : "Rejected the changes";
+      sections["Goal complete"] = final.complete;
+      sections["Why this decision"] = final.reason;
+      sections["Next steps / lessons"] = final.lesson;
+    } else sections["Implementation summary"] = final.summary;
+  }
+  if (id.startsWith("coder")) {
+    if (report) sections["Changed files"] = report.paths;
+    const edits = [];
+    matching.forEach((e) => {
+      const r = e.reply;
+      if (!r || !["write_file", "replace_text", "delete_file"].includes(r.tool))
+        return;
+      const index = trace.indexOf(e);
+      const result = trace
+        .slice(index + 1)
+        .find(
+          (x) =>
+            x.agent_id === id && ["role_reply", "tool_result"].includes(x.kind),
+        );
+      edits.push({
+        file: r.args.path,
+        action: {
+          write_file: "Write file",
+          replace_text: "Replace text",
+          delete_file: "Delete file",
+        }[r.tool],
+        status:
+          result?.kind !== "tool_result"
+            ? "Awaiting result"
+            : result.result.error
+              ? "Failed: " + result.result.error
+              : "Tool completed",
+        ...(r.tool === "replace_text"
+          ? { old: r.args.old, new: r.args.new }
+          : r.tool === "write_file"
+            ? { content: r.args.content }
+            : {}),
+      });
+    });
+    sections["File edits in this attempt"] = edits.length
+      ? edits
+      : "No direct file-tool edits recorded. Changes made through terminal commands are shown in the worker diff.";
+    sections["About these changes"] =
+      "Tool edits are provisional until checks and review accept the combined result.";
+  }
+  if (!final)
+    sections["Recorded explanation"] =
+      "No final explanation yet. The activity list shows the actions recorded so far.";
+  if (!matching.length && detail) Object.assign(sections, detail);
+  inspect(title, sections);
+  if (report?.patch && id.startsWith("coder-")) {
+    const patchButton = button(
+      "View this worker’s diff",
+      async () => {
+        const data = await api(
+          "patch?id=" +
+            encodeURIComponent(selected) +
+            "&attempt=" +
+            report.attempt +
+            "&agent=" +
+            encodeURIComponent(id),
+        );
+        selectedAgent = null;
+        inspect(title + " · changes", {
+          "Implementation summary": report.summary,
+          "Changed files": report.paths,
+          "Worker patch": data.available
+            ? data.patch || "No changes in this patch."
+            : "The worker patch is not available yet.",
+        });
+      },
+      "worker-diff",
+    );
+    if (!$("detail").querySelector(".worker-diff"))
+      $("detail").prepend(patchButton);
   }
 }
 function cleanReply(reply) {
@@ -71,6 +262,7 @@ function cleanReply(reply) {
   );
 }
 function inspectEvent(index) {
+  selectedAgent = null;
   selectedEvent = index;
   const event = events[index];
   const sections = {
@@ -157,38 +349,193 @@ function renderActivity() {
     );
     $("filter").value = filter;
   }
-  $("agents").replaceChildren();
-  for (const [id, e] of latest) {
-    const work =
-      running &&
-      !["role_finished", "worker_finished", "worker_failed"].includes(e.kind);
+  renderGraph();
+  if (selectedEvent !== null) inspectEvent(selectedEvent);
+}
+function renderGraph() {
+  const host = $("agents");
+  host.replaceChildren();
+  // Restrict the graph to the latest attempt, rather than mixing old workers
+  // and decisions with a newly resumed plan.
+  const start = events.findLastIndex(
+    (e) => e.kind === "role_started" && e.role === "planner",
+  );
+  const trace = start >= 0 ? events.slice(start) : [];
+  const dispatch = trace.find((e) => e.kind === "dispatch");
+  const workerIds = dispatch
+    ? dispatch.tasks.map((_, i) => "coder-" + (i + 1))
+    : trace.some((e) => e.agent_id === "coder")
+      ? ["coder"]
+      : [];
+  const ids = workerIds.length ? workerIds : ["workers"];
+  const width = Math.max(480, ids.length * 160);
+  const ends = new Map();
+  const intervals = [];
+  for (const e of trace) {
+    if (e.kind === "worker_started") ends.set(e.agent_id, e.time);
+    if (
+      ["worker_finished", "worker_failed"].includes(e.kind) &&
+      ends.has(e.agent_id)
+    ) {
+      intervals.push([ends.get(e.agent_id), e.time]);
+      ends.delete(e.agent_id);
+    }
+  }
+  for (const time of ends.values())
+    intervals.push([time, trace.at(-1)?.time || time]);
+  const points = intervals
+    .filter(([a, b]) => b > a)
+    .flatMap(([a, b]) => [
+      [a, 1],
+      [b, -1],
+    ])
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let concurrent = 0,
+    peak = 0;
+  for (const [, delta] of points) {
+    concurrent += delta;
+    peak = Math.max(peak, concurrent);
+  }
+  const active = running ? ends.size : 0;
+  const heading = node("div", undefined, "graph-heading");
+  heading.append(
+    node(
+      "strong",
+      "Agent flow · attempt " + (trace[0]?.attempt || state?.attempt || 0),
+    ),
+    node(
+      "span",
+      active > 1
+        ? `${active} workers running in parallel`
+        : peak > 1
+          ? `Peak: ${peak} workers overlapped`
+          : "Parallelism appears when workers overlap",
+      "parallel-badge",
+    ),
+  );
+  host.append(heading);
+  const scroll = node("div", undefined, "graph-scroll");
+  const canvas = node("div", undefined, "graph-canvas");
+  canvas.style.width = width + "px";
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", `0 0 ${width} 530`);
+  svg.setAttribute("aria-hidden", "true");
+  canvas.append(svg);
+  function edge(x1, y1, x2, y2, on = false) {
+    const path = document.createElementNS(ns, "path");
+    const middle = (y1 + y2) / 2;
+    path.setAttribute("d", `M ${x1} ${y1} V ${middle} H ${x2} V ${y2}`);
+    path.setAttribute("class", on ? "flow-edge live" : "flow-edge");
+    svg.append(path);
+    const arrow = document.createElementNS(ns, "path");
+    arrow.setAttribute(
+      "d",
+      `M ${x2 - 4} ${y2 - 6} L ${x2} ${y2} L ${x2 + 4} ${y2 - 6}`,
+    );
+    arrow.setAttribute("class", on ? "flow-edge live" : "flow-edge");
+    svg.append(arrow);
+  }
+  function addNode(id, title, x, y, matching, detail) {
+    const last = matching.at(-1);
+    const finished =
+      last &&
+      ["role_finished", "worker_finished", "integration", "check"].includes(
+        last.kind,
+      );
+    const failed =
+      last &&
+      (last.kind === "worker_failed" ||
+        (last.kind === "check" &&
+          (last.result.returncode !== 0 || last.result.timed_out)));
+    const isActive = running && last && !finished && !failed;
+    const status = failed
+      ? "Failed"
+      : finished
+        ? "Done"
+        : isActive
+          ? "Running"
+          : last
+            ? "Stopped"
+            : "Waiting";
     const b = button(
       "",
       () => {
         selectedEvent = null;
-        const task = events.findLast(
-          (x) => x.agent_id === id && x.kind === "worker_started",
-        );
-        const decision = events.findLast(
-          (x) => x.agent_id === id && x.reply?.final,
-        );
-        inspect(id, {
-          Assignment: task?.task,
-          "Latest action": label(e),
-          "Latest decision": decision?.reply.final,
-        });
-        $("filter").value = id;
+        selectedAgent = null;
+        selectedAgent = { id, title };
+        inspectAgent(id, title, trace, status, detail);
+        $("filter").value = knownAgents.includes(id) ? id : "";
         renderActivity();
       },
-      "agent" + (work ? " working" : ""),
+      "graph-node " +
+        (isActive ? "working" : failed ? "failed" : finished ? "done" : ""),
     );
+    b.style.left = x - 68 + "px";
+    b.style.top = y + "px";
     b.append(
-      node("strong", id),
-      node("small", work ? "● " + label(e) : label(e)),
+      node("strong", title),
+      node("small", status + (isActive ? " · " + label(last) : "")),
     );
-    $("agents").append(b);
+    b.setAttribute("aria-label", title + ": " + status);
+    canvas.append(b);
+    if (selectedAgent?.id === id)
+      inspectAgent(id, title, trace, status, detail);
   }
-  if (selectedEvent !== null) inspectEvent(selectedEvent);
+  const cx = width / 2;
+  const roles = (id) =>
+    trace.filter((e) => e.agent_id === id && e.kind !== "log");
+  edge(cx, 58, cx, 85);
+  addNode("planner", "Planner", cx, 0, roles("planner"));
+  addNode("critic", "Critic", cx, 85, roles("critic"));
+  ids.forEach((id, i) => {
+    const x = ((i + 0.5) * width) / ids.length;
+    edge(cx, 143, x, 190, active > 0 && ends.has(id));
+    edge(x, 248, cx, 300, active > 0 && ends.has(id));
+    addNode(id, id === "workers" ? "Coding workers" : id, x, 190, roles(id), {
+      Assignment: dispatch?.tasks[i],
+      Workspace: trace.find(
+        (e) => e.kind === "worker_started" && e.agent_id === id,
+      )?.workspace,
+    });
+  });
+  edge(cx, 358, cx, 385);
+  edge(cx, 443, cx, 470);
+  addNode(
+    "integration",
+    "Integration",
+    cx,
+    300,
+    trace.filter(
+      (e) =>
+        e.kind === "integration" ||
+        (workerIds[0] === "coder" &&
+          e.agent_id === "coder" &&
+          e.kind === "role_finished"),
+    ),
+    { Purpose: "Combine all worker patches after every worker finishes." },
+  );
+  addNode(
+    "checks",
+    "Checks",
+    cx,
+    385,
+    trace.filter((e) => ["check_started", "check"].includes(e.kind)),
+    {
+      Purpose:
+        "Run the required verification commands on the combined changes.",
+    },
+  );
+  addNode("reviewer", "Reviewer", cx, 470, roles("reviewer"));
+  scroll.append(canvas);
+  host.append(scroll);
+  host.append(
+    node(
+      "p",
+      "Branches are separate worker workspaces. They join only after all workers finish. Click a node to inspect it.",
+      "muted small",
+    ),
+  );
 }
 async function listRuns() {
   const data = await api("runs");
@@ -213,6 +560,7 @@ async function selectRun(id) {
   cursor = 0;
   events = [];
   selectedEvent = null;
+  selectedAgent = null;
   knownAgents = [];
   $("filter").value = "";
   $("composer").hidden = true;
@@ -286,6 +634,7 @@ $("new").onclick = () => {
   state = null;
   events = [];
   selectedEvent = null;
+  selectedAgent = null;
   $("composer").hidden = false;
   $("run-view").hidden = true;
   $("title").textContent = "What should we build?";
@@ -346,6 +695,7 @@ $("pause").onclick = async () => {
 };
 $("show-history").onclick = () => {
   selectedEvent = null;
+  selectedAgent = null;
   const sections = {};
   for (const attempt of state.history) {
     const prefix = "Attempt " + attempt.attempt + " · ";
@@ -371,6 +721,7 @@ $("show-history").onclick = () => {
 $("show-diff").onclick = async () => {
   try {
     selectedEvent = null;
+    selectedAgent = null;
     const data = await api("diff?id=" + encodeURIComponent(selected));
     inspect("Workspace changes", {
       "Diff from starting commit":
@@ -409,6 +760,7 @@ async function openFile(id, path, start = 1) {
 $("show-files").onclick = async () => {
   try {
     selectedEvent = null;
+    selectedAgent = null;
     const id = selected;
     const files = await api("files?id=" + encodeURIComponent(id));
     inspectorSignature = "";
@@ -433,6 +785,7 @@ $("integrate").onclick = async () => {
   try {
     const result = await api("integrate", { id: selected });
     selectedEvent = null;
+    selectedAgent = null;
     inspect("Changes applied", result);
     await poll();
   } catch (e) {

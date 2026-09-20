@@ -42,7 +42,9 @@ final fields: approved (boolean), reason (string).''',
     "coder": '''Implement the approved proposal. Inspect before editing; add appropriate tests.
 Use tools to actually make the changes. Do not merely describe code. Existing user-protected paths
 must remain unchanged. Do not commit, switch branches, reset, or manipulate Git metadata.
-final fields: summary (string).''',
+final fields: summary (string). Summarize what changed, why you chose this approach,
+which checks actually ran and their results, and any remaining limitations. Give a concise
+user-facing explanation grounded in your actions; do not claim checks you did not run.''',
     "reviewer": '''Evaluate the actual changes, check results and the original goal. Inspect source
 and tests. Passing commands alone do not prove the goal is achieved; reject test weakening,
 meaningless checks or regressions. Accept a sound partial increment if useful. Complete only if

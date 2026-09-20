@@ -220,3 +220,7 @@ __marimo__/
 # GoalForge local provider configuration
 .env.*
 !.env.example
+
+# Generated local demo repositories
+/demos/*
+!/demos/.gitkeep

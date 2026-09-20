@@ -91,6 +91,11 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.request('/api/run?id=' + run_id + '&cursor=' + str(snapshot['cursor']))[1]['events'], [])
         self.assertIn('VALUE = 2', self.request('/api/file?id=' + run_id + '&path=left.py')[1]['text'])
         self.assertIn('+VALUE = 2', self.request('/api/diff?id=' + run_id)[1]['diff'])
+        patch_status, worker_patch = self.request('/api/patch?id=' + run_id + '&attempt=1&agent=coder-1')
+        self.assertEqual(patch_status, 200)
+        self.assertTrue(worker_patch['available'])
+        self.assertIn('+VALUE = 2', worker_patch['patch'])
+        self.assertEqual(self.request('/api/patch?id=' + run_id + '&attempt=1&agent=../state')[0], 400)
         self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), self.base)
         for path in ('.env', '../state.json', '/etc/passwd'):
             self.assertEqual(self.request('/api/file?id=' + run_id + '&path=' + path)[0], 400)

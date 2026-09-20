@@ -38,7 +38,9 @@ def run(argv=None):
         destination = args.demo_dir.resolve()
         destination.mkdir(parents=True, exist_ok=False)
     else:
-        destination = Path(tempfile.mkdtemp(prefix="goalforge-parallel-demo-", dir=PROJECT.parent))
+        demos = PROJECT / "demos"
+        demos.mkdir(exist_ok=True)
+        destination = Path(tempfile.mkdtemp(prefix="goalforge-parallel-demo-", dir=demos))
     shutil.copytree(PROJECT / "examples" / "parallel_project", destination, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     (destination / ".gitignore").write_text("__pycache__/\n*.pyc\n.env\n", encoding="utf-8")

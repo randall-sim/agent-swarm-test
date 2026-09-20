@@ -271,6 +271,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('Folder not found')
                 children = sorted(p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith('.'))[:500]
                 return self.respond(dict(path=str(root), parent=str(root.parent), folders=children))
+            if url.path == '/api/patch':
+                store = app.store(arg('id'))
+                attempt = int(arg('attempt', '0'))
+                agent = arg('agent')
+                if attempt < 1 or agent not in {f'coder-{n}' for n in range(1, 9)}:
+                    raise ValueError('Invalid worker or attempt')
+                path = store.root / 'workers' / f'attempt-{attempt}' / f'{agent}.patch'
+                if not path.is_file():
+                    return self.respond({'patch': '', 'available': False})
+                return self.respond(store.redact({'patch': path.read_text()[:200000], 'available': True}))
             if url.path in {'/api/files', '/api/file', '/api/diff'}:
                 store = app.store(arg('id'))
                 state = store.read()
