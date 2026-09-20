@@ -14,7 +14,7 @@ def next_step(state):
         instruction = "Accepted code has no saved verification output. Inspect or verify current code; do not infer failures from the original baseline."
     elif not passed:
         mode = "repair"
-        instruction = "Fix current verification failures and concrete defects; preserve working behavior."
+        instruction = "Investigate current verification failures before repair: derive the expected result from the goal and test fixture, inspect implementation, and distinguish an implementation defect from an incorrect generated assertion or environment failure. Preserve working behavior and original tests."
     elif defects:
         mode = "repair"
         instruction = "Checks pass, but the reviewer identified defects in implemented behavior. Fix those specific defects."

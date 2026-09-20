@@ -1,6 +1,8 @@
 """File tools and bounded processes. A worktree is isolation, not a sandbox."""
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import fnmatch
 import os
 from pathlib import Path
@@ -22,14 +24,18 @@ def sensitive(path: Path) -> bool:
                for part in parts)
 
 
-def run_process(argv: list[str], cwd: Path, timeout: float, secret: str = "") -> dict:
+def run_process(argv: list[str], cwd: Path, timeout: float, secret: str = "", *, fresh_python_cache: bool = False) -> dict:
     if not isinstance(argv, list) or not argv or any(not isinstance(x, str) or not x for x in argv):
         raise ValueError("argv must be a nonempty list of nonempty strings")
     env = {k: v for k, v in os.environ.items()
            if not any(word in k.upper() for word in ("API_KEY", "TOKEN", "SECRET", "PASSWORD"))
            and (not secret or secret not in v)}
     # A temporary disk file prevents a noisy process from exhausting Python memory.
-    with tempfile.TemporaryFile() as output:
+    with (tempfile.TemporaryDirectory(prefix="goalforge-check-cache-") if fresh_python_cache else nullcontext(None)) as cache, tempfile.TemporaryFile() as output:
+        if cache:
+            # Same-size edits within one filesystem timestamp tick must not run stale .pyc files.
+            env["PYTHONPYCACHEPREFIX"] = cache
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
         try:
             process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                        stdout=output, stderr=subprocess.STDOUT,

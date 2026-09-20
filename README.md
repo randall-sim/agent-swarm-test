@@ -276,7 +276,8 @@ Exit codes: `0` for complete or successful inspection, `2` for an incomplete/bud
 | `--workers` | 3 for new CLI runs | Concurrent coding workers (1–8); planner may use fewer |
 | `--iterations` | 5 | Attempts during this invocation |
 | `--max-calls` | 80 | Shared across all roles and workers, including retries |
-| `--role-steps` | 12 | Responses/tool steps per role |
+| `--role-steps` | 12 | Responses/tool steps per non-coding role |
+| `--coder-steps` | 30 | Responses/tool steps per coding agent, including parallel workers |
 | `--max-tokens` | 4096 | Requested output-token limit per response |
 | `--timeout` | 120 | Seconds per local command |
 | `--api-timeout` | 90 | Seconds per HTTP request |
@@ -642,3 +643,61 @@ of semantic equivalence for every file type. Two consecutive `no_progress` attem
 pause the run, preserving the prior candidate and accepted code. The reviewer also
 receives the attempt-specific diff, so cumulative earlier work cannot masquerade as
 new progress. A larger request budget does not bypass these gates.
+
+### Which limit stopped a run?
+
+The web UI and CLI distinguish three resumable stops:
+
+- **Attempt limit reached:** the configured number of attempts for this start/resume
+  session completed without finishing the goal. Increase Attempts when resuming.
+- **Shared request limit reached:** all agents together used the session's HTTP
+  request allowance, including retries. Increase Request budget when resuming.
+- **Agent step limit reached:** a particular agent exhausted its model/tool loop
+  allowance. The message names the agent and role and gives its step limit. Narrow
+  the task or increase `--coder-steps` (coders) / `--role-steps` (other roles).
+
+Run state retains `status: budget_exhausted` for compatibility and adds a structured
+`stop_reason` with `kind`, `limit`, `used`, agent identity where applicable, and an
+explanation. `limit_reached` events preserve these stops in the trace. Resuming
+clears the previous stop reason. Old runs with an explicit recorded error can be
+labeled; otherwise the UI says the limit type was not recorded rather than guessing
+from cumulative usage. Rate-limit (HTTP 429) pauses remain separate from these limits.
+
+### Diagnose the test as well as the implementation
+
+A failed assertion establishes a mismatch, not its cause. Planning and review now
+include structured `failure_analysis`: observed result, classification
+(`implementation`, `test_expectation`, `environment`, or `uncertain`), relevant
+files, requirement, independently derived expected result, evidence, and next action.
+Classifying an implementation or expectation defect requires reading both the test
+and implementation during that role invocation. Repeated failing check/test identities
+are highlighted in `failure_diagnosis`; agents must inspect intermediate state instead
+of repeating a speculative fix. These fields are visible in Plans & decisions and
+the exact active context. Historical reviewer explanations remain hypotheses until
+supported by evidence.
+
+For example, a fixture with 5 available items, an idempotent reservation replay,
+and a new order consuming 1 item should have 4 available after reopening. A generated
+assertion expecting 3 is a test defect; migration must not consume an extra item just
+to satisfy it.
+
+Test provenance comes from the run's original Git commit. Existing original Python
+test files are protected automatically in addition to configured protected paths.
+New tests remain subject to review. To correct an existing agent-generated test,
+the planner must read the test and implementation and propose `test_corrections`
+with an exact old/new assertion, requirement, expected-value derivation, evidence,
+and explanation of preserved coverage. Supported corrections retain the equality
+assertion and actual expression, changing only the concrete expected value.
+Deleting/skipping tests, tautologies, fixture changes, and edits beyond the exact
+proposed replacement are rejected. Add new regression scenarios in new test files;
+this narrow correction mechanism does not authorize rewriting existing test suites.
+
+The reviewer must independently read and assess a correction, explicitly record
+`test_corrections_valid` and `test_correction_review`, and all verification commands
+must still pass. Protected original tests cannot be corrected through this mechanism;
+an apparent conflict must be reported rather than silently weakened. Evidence checks
+and edit boundaries are enforced in code, but interpretation of a requirement still
+requires model/human judgment.
+
+Verification commands receive a fresh Python bytecode-cache location so same-size
+edits within one timestamp tick cannot accidentally execute an older cached assertion.

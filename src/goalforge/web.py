@@ -9,6 +9,7 @@ import threading
 from urllib.parse import parse_qs, urlsplit
 import webbrowser
 
+from .limits import status_label
 from .repair import clear_candidate
 from .verification import verification_commands
 from .engine import Engine
@@ -101,7 +102,9 @@ class WebApp:
                 live_usage = {name: self.initial_usage.get(name, 0) + getattr(budget, field)
                               for name, field in [('requests', 'used'), ('input_tokens', 'input_tokens'),
                                                   ('output_tokens', 'output_tokens')]}
-        return store.redact(dict(state=store.read(), events=events, cursor=cursor,
+        state = store.read()
+        state["status_label"] = status_label(state)
+        return store.redact(dict(state=state, events=events, cursor=cursor,
                                  approvals=approvals, running=running, live_usage=live_usage,
                                  stopping=running and self.cancelled.is_set()))
 
@@ -127,6 +130,7 @@ class WebApp:
             calls = number('max_calls', 80, 10000)
             iterations = number('iterations', 5, 100)
             steps = number('role_steps', 12, 100)
+            coder_steps = number('coder_steps', 30, 100)
             instructions = str(data.get('instructions', '')).strip()
             if len(instructions) > 16000:
                 raise ValueError('Instructions must be under 16,000 characters')
@@ -165,7 +169,7 @@ class WebApp:
             store.secret = key
             state = store.read()
             state['run_settings'] = dict(max_calls=calls, workers=workers,
-                                         iterations=iterations, role_steps=steps)
+                                         iterations=iterations, role_steps=steps, coder_steps=coder_steps)
             store.write(state)
             self.cancelled = threading.Event()
             self.active = state['id']
@@ -195,7 +199,7 @@ class WebApp:
                     workspace = Workspace(Path(state['workspace']), approve, 120, state['protected'], key)
                     engine = Engine(store, client, workspace, steps,
                                     lambda message: store.event('log', message=message),
-                                    workers=workers, cancelled=self.cancelled)
+                                    workers=workers, cancelled=self.cancelled, coder_steps=coder_steps)
                     engine.execute(iterations)
                 except Exception as exc:
                     store.event('server_error', message=str(exc))
@@ -300,7 +304,7 @@ class Handler(BaseHTTPRequestHandler):
                 for p in sorted(app.runs.glob('*/state.json'), reverse=True):
                     try:
                         state = json.loads(p.read_text())
-                        runs.append({k: state.get(k) for k in ('id', 'goal', 'status', 'repo', 'model')})
+                        runs.append({**{k: state.get(k) for k in ('id', 'goal', 'status', 'repo', 'model')}, 'status_label': status_label(state)})
                     except (OSError, ValueError):
                         continue
                 return self.respond(app.store(runs[0]['id']).redact(runs) if runs else [])

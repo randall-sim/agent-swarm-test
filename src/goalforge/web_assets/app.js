@@ -1076,7 +1076,10 @@ async function listRuns() {
     );
     b.append(
       node("strong", run.goal),
-      node("small", run.status + " · " + run.id.slice(0, 8)),
+      node(
+        "small",
+        (run.status_label || run.status) + " · " + run.id.slice(0, 8),
+      ),
     );
     $("runs").append(b);
   }
@@ -1129,7 +1132,7 @@ async function poll() {
       ? "Pausing…"
       : running
         ? "Running"
-        : state.status;
+        : state.status_label || state.status;
     $("meta").textContent =
       `${state.repo}\nWorkspace: ${state.workspace} · ${state.model} · ${(data.live_usage || state.usage).requests || 0} requests · ${(data.live_usage || state.usage).input_tokens || 0} input / ${(data.live_usage || state.usage).output_tokens || 0} output tokens`;
     $("meta").style.whiteSpace = "pre-wrap";
@@ -1251,6 +1254,10 @@ $("show-history").onclick = () => {
       sections[prefix + "plan"] = attempt.proposal.approach;
       sections[prefix + "acceptance"] = attempt.proposal.acceptance;
       sections[prefix + "assignments"] = attempt.proposal.tasks;
+      sections[prefix + "failure diagnosis"] =
+        attempt.proposal.failure_analysis;
+      sections[prefix + "proposed test corrections"] =
+        attempt.proposal.test_corrections;
     }
     if (attempt.critique) sections[prefix + "critic"] = attempt.critique.reason;
     if (attempt.workers)
@@ -1261,6 +1268,10 @@ $("show-history").onclick = () => {
       sections[prefix + "next-step context"] = attempt.progress;
     if (attempt.review) {
       sections[prefix + "reviewer"] = attempt.review.reason;
+      sections[prefix + "reviewer failure diagnosis"] =
+        attempt.review.failure_analysis;
+      sections[prefix + "test correction review"] =
+        attempt.review.test_correction_review;
       sections[prefix + "defects"] = attempt.review.defects;
       sections[prefix + "remaining requirements"] =
         attempt.review.remaining_work;

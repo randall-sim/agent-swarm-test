@@ -130,7 +130,7 @@ def implement_parallel(engine: Engine, state: dict, context: dict, item: dict) -
             workspace = Workspace(path, approve, engine.workspace.timeout,
                                   engine.workspace.protected, engine.workspace.secret, set(task["files"]))
             worker = Engine(engine.store, engine.client.fork(), workspace, engine.steps,
-                            engine.emit, agent_id=agent_id, cancelled=cancelled)
+                            engine.emit, agent_id=agent_id, cancelled=cancelled, coder_steps=engine.coder_steps)
             prepared.append((worker, task, folder / f"{agent_id}.patch"))
 
         def code(entry):

@@ -7,10 +7,13 @@ from threading import Event
 from typing import Callable
 
 from .context import evidence_packet, latest_accepted, retrieve_history
+from .failures import (failure_context, original_tests, is_test, validate_analysis,
+                       validate_test_corrections, test_edit_violation)
+from .limits import limit_stop
 from .progress import next_step
 from .repair import restore_candidate, checkpoint_candidate, clear_candidate
 from .tool_schemas import definitions
-from .provider import BudgetExceeded, Client, ProviderError, RateLimitExceeded
+from .provider import AgentStepLimitExceeded, BudgetExceeded, Client, ProviderError, RateLimitExceeded
 from .state import Store, fingerprint, git, rollback, save
 from .workspace import OUTPUT_LIMIT, Workspace, run_process, sensitive
 from .swarm import PARALLEL_PLANNER, WorkerCancelled, cleanup_workers, implement_parallel, validate_tasks
@@ -170,11 +173,12 @@ def decode_reply(name: str, reply: dict) -> tuple[str, dict]:
 class Engine:
     def __init__(self, store: Store, client: Client, workspace: Workspace,
                  steps: int = 12, emit: Callable[[str], None] = print, workers: int = 1,
-                 agent_id: str | None = None, cancelled: Event | None = None):
+                 agent_id: str | None = None, cancelled: Event | None = None, coder_steps: int = 30):
         self.store, self.client, self.workspace = store, client, workspace
         if not 1 <= workers <= 8:
             raise ValueError("workers must be between 1 and 8")
         self.steps, self.emit = steps, emit
+        self.coder_steps = coder_steps
         self.workers, self.agent_id = workers, agent_id
         self.cancelled = cancelled or Event()
 
@@ -223,6 +227,14 @@ Also return reopen_source (none/current_check/source_defect/user_change), reopen
 Return blocker_kind (none, shared_interface, ownership, requirement, or current_defect) and evidence (specific conflicting signatures, assignment, or violated requirement; empty on approval). A missing destination file or directory is NEVER a blocker: coding tools can create them. Existing tests/CONTRACT do not prohibit requested extensions. Do not demand design of deferred features. A single worker owning coupled code and tests has no cross-worker interface dependency; judge only actual dispatched tasks. Current evidence supersedes baseline history. Approve useful new capability plans even when their implementation/tests do not exist yet."""
         if name == "reviewer":
             prompt += "\nReview the attempt_diff for actual new behavior against observable_change, not just the cumulative diff. No changes or cosmetic-only changes are not an increment. Do not approve repeated maintenance of already accepted capabilities as progress."
+        if name in {"planner", "reviewer"}:
+            prompt += """\nTEST FAILURE DIAGNOSIS: A failed assertion proves a mismatch, not that production code is wrong. Return failure_analysis (empty when no failures): each entry has classification (implementation/test_expectation/environment/uncertain), test_file, implementation_file, observation, requirement, expected_derivation, evidence, next_action. Read the fixture, assertion and relevant implementation; derive expected state independently from the user's requirement before proposing repairs. Distinguish observed facts from hypotheses. On repeated failures trace intermediate state before/after each operation, especially replay and reopen. Never infer migration corruption solely from a final assertion. For example: available=5, idempotent replay consumes 0, new order consumes 1, reopen consumes 0 => expected 4, not 3. Use uncertain if evidence does not establish the cause. Original acceptance tests cannot be changed; report a conflict if one appears inconsistent."""
+        if name == "planner":
+            prompt += """\nReturn test_corrections (empty unless correcting an existing generated assertion). Each correction requires path, exact unique old_assertion, new_assertion, requirement, expected_derivation, evidence, coverage_preserved, implementation_file. Read both files first. Explain why the expectation conflicts with requirements, not merely why it differs from output. Only replace one equality assertion (assertEqual/assertListEqual/assertDictEqual/assertTupleEqual/assertSetEqual), preserving its actual expression and changing its concrete expected value. Keep fixture operations and coverage intact. Assign the test file to a worker when a correction is justified. Do not alter implementation just to satisfy an incorrect generated expectation. Resolve uncertainty by investigation before changing assertions."""
+        if name == "coder":
+            prompt += "\nInspect test fixtures as well as implementation when checks fail. Existing agent-generated tests may be wrong. Only make existing-test changes listed in proposal.test_corrections, using the exact assertion replacement; never delete tests, skip cases, or weaken original acceptance tests. For any uncertain cause, trace state transitions and report evidence rather than guessing."
+        if name == "reviewer":
+            prompt += """\nReturn test_corrections_valid (boolean) and test_correction_review (string; empty when none). Independently verify each proposed expectation correction against requirements and the unchanged fixture/operations, not just passing results. State the arithmetic or invariant and why coverage remains meaningful. If a correction is unproven or weakens coverage set test_corrections_valid=false and accept=false. A failing generated test may itself be defective: identify its assertion instead of repeating a speculative implementation diagnosis."""
         example = {key: (False if kind is bool else "...") for key, kind in REQUIRED[name].items()}
         if name == "planner" and self.workers > 1:
             example["tasks"] = [{"title": "...", "approach": "...", "acceptance": "...", "files": ["relative/file.py"]}]
@@ -233,6 +245,12 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
             example.update(blocker_kind="none", evidence="")
         if name == "reviewer":
             example.update(defects="...", remaining_work="...", next_increment="...")
+        if name in {"planner", "reviewer"}:
+            example["failure_analysis"] = []
+        if name == "planner":
+            example["test_corrections"] = []
+        if name == "reviewer":
+            example.update(test_corrections_valid=True, test_correction_review="")
         final_example = json.dumps({"final": example})
         if not native:
             prompt += "\nFinal response shape (replace example values with your answer): " + final_example
@@ -244,6 +262,7 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
                     {"role": "user", "content": json.dumps(context, ensure_ascii=False)}]
         invalid_streak = 0
         tool_calls = 0
+        inspected = set()
 
         def append_exchange(reply: dict, text: str) -> None:
             if "_native_message" in reply:
@@ -269,6 +288,8 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
                 messages.append({"role": "user", "content": correction})
 
         sources = {
+            "failure_diagnosis": "Observed failures and recurrence; diagnoses require independent test/implementation evidence",
+            "test_policy": "Original test provenance and rules for evidence-backed generated-test corrections",
             "current_evidence": "Checks for the loaded candidate or latest accepted checkpoint; old baseline is archived",
             "settled": "Latest accepted capability and review; reopen only with new concrete evidence",
             "history_catalog": "Archive pointers only; details are not in active context unless retrieved",
@@ -295,7 +316,8 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
             "diff": "Git staged diff of the combined implementation",
             "check_results": "Acceptance commands run against the combined implementation",
         }
-        for request_number in range(1, self.steps + 1):
+        step_limit = self.coder_steps if name == "coder" else self.steps
+        for request_number in range(1, step_limit + 1):
             if self.cancelled.is_set():
                 raise WorkerCancelled("Paused by user")
             self.store.event("agent_context", agent_id=label, role=name,
@@ -321,7 +343,7 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
                 if action == "final" and name == "coder" and tool_calls == 0:
                     raise ValueError("No workspace tools have been called. Inspect the assigned files and implement the task using read_file/write_file/replace_text before finishing.")
                 if action == "final":
-                    self.validate_decision(name, payload, context)
+                    self.validate_decision(name, payload, context, inspected)
                 if action == "final" and name == "planner" and self.workers > 1:
                     validate_tasks(payload, self.workspace, task_limit)
             except ValueError as exc:
@@ -343,6 +365,8 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
                                      attempt=context.get("attempt"), reference=payload.get("args", {}))
                 else:
                     result = self.workspace.execute(payload["tool"], payload.get("args", {}), name == "coder")
+                    if payload["tool"] == "read_file":
+                        inspected.add(payload["args"]["path"])
             except (ValueError, KeyError, OSError, TypeError, UnicodeError) as exc:
                 result = {"error": str(exc)}
             result = self.store.redact(result)
@@ -352,7 +376,7 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
             # Keep the initial goal/context and the most recent tool exchanges.
             while sum(len(json.dumps(m)) for m in messages) > 100_000 and len(messages) > 4:
                 del messages[2:4]
-        raise BudgetExceeded(f"{name} reached its {self.steps}-step limit; run can be resumed.")
+        raise AgentStepLimitExceeded(label, name, step_limit)
 
     def check(self, state: dict) -> list[dict]:
         results = []
@@ -372,7 +396,7 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
             if self.cancelled.is_set():
                 raise WorkerCancelled("Paused by user")
             self.store.event("check_started", argv=argv, attempt=state["attempt"])
-            result = run_process(argv, self.workspace.root, self.workspace.timeout, self.workspace.secret)
+            result = run_process(argv, self.workspace.root, self.workspace.timeout, self.workspace.secret, fresh_python_cache=True)
             self.store.event("check", result=result)
             results.append(result)
             self.emit("    " + ("PASS" if result["returncode"] == 0 and not result["timed_out"] else "FAIL"))
@@ -406,9 +430,14 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
             "blockers": list(reversed(blockers[:3])),
             "policy": "Declare current increment and deferred work. Address each objection. Only interfaces crossing this attempt's parallel workers must be fixed before dispatch. Full-goal completion is assessed later by the reviewer.",
         }
+        originals = original_tests(state)
         return {"goal": state["goal"], "directive": state["directive"], "repair": repair, "planning": planning, "progress": progress,
                 "attempt": state["attempt"], "max_workers": planning["max_workers"],
-                "checks": state["checks"], "protected_paths": state["protected"],
+                "checks": state["checks"], "protected_paths": self.workspace.protected,
+                "failure_diagnosis": failure_context(state),
+                "test_policy": {"original_tests": originals,
+                                "generated_tests": [p for p in self.workspace.files() if is_test(p) and p not in originals],
+                                "rule": "Original tests immutable. Existing generated assertions may be corrected only with an evidence-backed exact replacement, then independent review and all checks."},
                 "current_evidence": evidence_packet(state),
                 "settled": {"attempt": latest_accepted(state).get("attempt"),
                             "capability": latest_accepted(state).get("proposal", {}).get("title"),
@@ -422,7 +451,26 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
                                     "tool": "retrieve_history", "note": "Historical details are archived, not active. Fetch only relevant evidence. Initial baseline is attempt 0/checks."},
                 "file_index": self.workspace.files()[:500]}
 
-    def validate_decision(self, name, payload, context):
+    def validate_decision(self, name, payload, context, inspected=None):
+        if "failure_analysis" in payload:
+            validate_analysis(payload["failure_analysis"])
+            failed = context.get("failure_diagnosis", {}).get("has_failures") if name == "planner" else any(r['returncode'] or r.get('timed_out') for r in context.get('check_results', []))
+            if failed and not payload["failure_analysis"]:
+                raise ValueError("Current checks fail: supply failure_analysis separating observed mismatch from implementation/test/environment hypotheses")
+            for analysis in payload["failure_analysis"]:
+                if analysis['classification'] in {'implementation', 'test_expectation'}:
+                    if not {analysis['test_file'], analysis['implementation_file']} <= (inspected or set()):
+                        raise ValueError("Read both the test fixture/assertion and relevant implementation before assigning a failure cause; otherwise report uncertain")
+        if name == "planner":
+            validate_test_corrections(payload, self.workspace, context.get('test_policy', {}), inspected or set())
+        if name == "reviewer" and context.get('proposal', {}).get('test_corrections'):
+            if type(payload.get('test_corrections_valid')) is not bool or not str(payload.get('test_correction_review', '')).strip():
+                raise ValueError("Independently review the test correction and explain requirement derivation and preserved coverage")
+            if payload.get('accept') and not payload['test_corrections_valid']:
+                raise ValueError("Cannot accept an unproven or weakened test correction")
+            for correction in context['proposal']['test_corrections']:
+                if not {correction['path'], correction['implementation_file']} <= (inspected or set()):
+                    raise ValueError("Independently read the corrected test and relevant implementation before reviewing its expected value")
         if name == "planner" and (context.get("settled", {}).get("attempt") or "increment_kind" in payload):
             if payload.get("increment_kind") not in {"advance", "repair"} or not str(payload.get("observable_change", "")).strip():
                 raise ValueError("Declare increment_kind (advance/repair) and an observable_change with verification; accepted maintenance is not progress")
@@ -487,6 +535,7 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
                 if discard_candidate:
                     clear_candidate(self.store, state, "Explicitly discarded before resume")
                 state["workers"] = self.workers
+                self.workspace.protected = list(dict.fromkeys([*self.workspace.protected, *original_tests(state)]))
                 cleanup_workers(self, state)
                 rollback(state)  # Discard interrupted, unaccepted edits on resume.
                 if state["baseline"] is None:
@@ -495,6 +544,7 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
                     rollback(state)  # A check must not silently alter the starting source.
                     self.store.write(state)
                 state.pop("last_error", None)
+                state.pop("stop_reason", None)
                 state["status"] = "running"
                 self.store.write(state)
                 rejected_plans = 0
@@ -574,12 +624,23 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
                         break
                 if state["status"] == "running":
                     state["status"] = "budget_exhausted"
+                    state["stop_reason"] = limit_stop("attempt_limit", iterations, iterations)
+                    state["last_error"] = state["stop_reason"]["message"]
+                    self.store.event("limit_reached", attempt=state["attempt"], stop_reason=state["stop_reason"])
+                    self.emit(state["last_error"])
             except (KeyboardInterrupt, Exception) as exc:
                 # Persist failed execution as knowledge; never retain unreviewed edits.
                 state["status"] = "paused" if isinstance(exc, (KeyboardInterrupt, WorkerCancelled, RateLimitExceeded)) else "error"
                 if isinstance(exc, BudgetExceeded):
                     state["status"] = "budget_exhausted"
                 error = str(exc) or "Interrupted by user"
+                if isinstance(exc, AgentStepLimitExceeded):
+                    state["stop_reason"] = limit_stop("agent_step_limit", exc.limit, exc.limit, exc.agent_id, exc.role)
+                elif isinstance(exc, BudgetExceeded):
+                    state["stop_reason"] = limit_stop("request_limit", self.client.budget.limit, self.client.budget.used)
+                if isinstance(exc, BudgetExceeded):
+                    error = state["stop_reason"]["message"]
+                    self.store.event("limit_reached", attempt=state["attempt"], stop_reason=state["stop_reason"])
                 state["last_error"] = error
                 state["history"].append({"attempt": state["attempt"], "outcome": "interrupted",
                                          "lesson": error, "proposal": locals().get("proposal"),
@@ -633,6 +694,12 @@ Return blocker_kind (none, shared_interface, ownership, requirement, or current_
         # Large changes cannot be fairly judged by a silently truncated diff.
         if len(diff) > 60000:
             item.update(outcome="reverted", lesson="Diff exceeded 60,000 characters; propose a smaller increment.")
+            rollback(state)
+            return
+        test_violation = test_edit_violation(root, item["base"], context["proposal"], original_tests(state))
+        if test_violation:
+            item.update(outcome="reverted", lesson=test_violation)
+            self.store.event("test_change_rejected", attempt=state["attempt"], reason=test_violation)
             rollback(state)
             return
         item["changed_code"] = bool(git(root, "diff", "--cached", "--name-only", item["base"]))

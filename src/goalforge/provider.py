@@ -23,6 +23,12 @@ class BudgetExceeded(RuntimeError):
     pass
 
 
+class AgentStepLimitExceeded(BudgetExceeded):
+    def __init__(self, agent_id, role, limit):
+        self.agent_id, self.role, self.limit = agent_id, role, limit
+        super().__init__(f"{agent_id} reached its {limit}-step limit; run can be resumed.")
+
+
 @dataclass
 class Budget:
     limit: int

@@ -16,6 +16,15 @@ class ContextPolicyTests(unittest.TestCase):
         self.engine = Engine(self.case.store, fixtures.ScriptedClient([]), self.case.workspace,
                              emit=lambda _: None)
 
+    def test_coder_has_thirty_steps_instead_of_twelve(self):
+        read = {'tool': 'read_file', 'args': {'path': 'value.txt'}}
+        responses = [read] * 29 + [{'final': {'summary': 'Finished on step thirty'}}]
+        engine = Engine(self.case.store, fixtures.ScriptedClient(responses), self.case.workspace,
+                        emit=lambda _: None)
+        self.assertEqual(engine.role('coder', {'attempt': 1})['summary'], 'Finished on step thirty')
+        self.assertEqual(engine.steps, 12)
+        self.assertEqual(engine.coder_steps, 30)
+
     def accepted(self):
         engine = Engine(self.case.store, fixtures.ScriptedClient(fixtures.replies(complete=False)),
                         self.case.workspace, emit=lambda _: None)

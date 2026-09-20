@@ -34,6 +34,17 @@ def definitions(role: str, final_fields: dict, parallel: bool) -> list[dict]:
         ]
     properties = {key: {"type": "boolean" if kind is bool else "string"}
                   for key, kind in final_fields.items()}
+    analysis = {"type": "array", "items": object_schema({
+        "classification": {"type": "string", "enum": ["implementation", "test_expectation", "environment", "uncertain"]},
+        **{key: text for key in ("test_file", "implementation_file", "observation", "requirement", "expected_derivation", "evidence", "next_action")}})}
+    if role in {"planner", "reviewer"}:
+        properties["failure_analysis"] = analysis
+    if role == "planner":
+        properties["test_corrections"] = {"type": "array", "items": object_schema({key: text for key in (
+            "path", "old_assertion", "new_assertion", "requirement", "expected_derivation", "evidence", "coverage_preserved", "implementation_file")})}
+    if role == "reviewer":
+        properties["test_corrections_valid"] = {"type": "boolean"}
+        properties["test_correction_review"] = text
     if role == "planner":
         properties.update({"increment_kind": {"type": "string", "enum": ["advance", "repair"]},
                            "reopen_evidence": text, "observable_change": text,

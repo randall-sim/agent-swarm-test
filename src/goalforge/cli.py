@@ -9,6 +9,7 @@ from threading import RLock
 
 from .verification import verification_commands
 from .config import settings
+from .limits import status_label
 from .engine import Engine
 from .provider import Budget, Client
 from .state import Store, create_run
@@ -49,7 +50,8 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--workers", type=worker_count, help="Concurrent coding workers, 1–8 (new runs default to 3; 1 uses sequential mode)")
         command.add_argument("--iterations", type=positive, default=5, help="Maximum attempts this invocation (default 5)")
         command.add_argument("--max-calls", type=positive, default=80, help="Maximum HTTP requests, including retries (default 80)")
-        command.add_argument("--role-steps", type=positive, default=12, help="Maximum requests per role (default 12)")
+        command.add_argument("--coder-steps", type=positive, default=30, help="Maximum steps per coding agent (default 30)")
+        command.add_argument("--role-steps", type=positive, default=12, help="Maximum steps per non-coding role (default 12)")
         command.add_argument("--max-tokens", type=positive, default=4096, help="Maximum output tokens per request")
         command.add_argument("--timeout", type=positive, default=120, help="Timeout per command in seconds")
         command.add_argument("--api-timeout", type=positive, default=90, help="Timeout per HTTP request in seconds")
@@ -85,7 +87,7 @@ def resolve_store(args) -> Store:
 
 
 def report(state: dict) -> None:
-    print(f"\nRun: {state['id']}\nStatus: {state['status']}\nGoal: {state['goal']}")
+    print(f"\nRun: {state['id']}\nStatus: {status_label(state)}\nGoal: {state['goal']}")
     print(f"Coding worker limit: {state.get('workers', 1)}")
     print(f"Branch: {state['branch']}\nWorkspace: {state['workspace']}")
     print(f"Accepted commit: {state['accepted_commit']}\nUsage: {json.dumps(state['usage'])}")
@@ -168,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
               ("are authorized by --yes." if args.yes else "require approval."))
         workspace = Workspace(Path(state["workspace"]), approve, args.timeout, state["protected"], key)
         emit(f"Coding worker limit: {workers} (one shared request budget)")
-        result = Engine(store, client, workspace, args.role_steps, emit, workers=workers).execute(args.iterations, discard_candidate=getattr(args, "discard_candidate", False))
+        result = Engine(store, client, workspace, args.role_steps, emit, workers=workers, coder_steps=args.coder_steps).execute(args.iterations, discard_candidate=getattr(args, "discard_candidate", False))
         report(result)
         return 0 if result["status"] == "complete" else (1 if result["status"] == "error" else 2)
     except (OSError, ValueError, RuntimeError) as exc:
