@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goalforge-agent"
+version = "0.1.0"
+description = "A small, knowledge-driven CLI coding agent inspired by RecEvolve"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "GoalForge contributors"}]
+dependencies = []
+
+[project.scripts]
+goalforge = "goalforge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
