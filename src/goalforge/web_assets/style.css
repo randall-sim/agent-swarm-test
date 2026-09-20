@@ -703,3 +703,85 @@ dialog::backdrop {
   width: 100%;
   margin: 8px 0;
 }
+
+.request-navigation {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 12px 0;
+}
+.diff-browser {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+.diff-file-list {
+  display: flex;
+  gap: 6px;
+  flex-direction: column;
+  max-height: 240px;
+  overflow: auto;
+}
+.diff-file-list button {
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.diff-file-list button[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: #224035;
+}
+.diff-file-content {
+  overflow: auto;
+  min-width: 0;
+}
+.diff-file-content h3 {
+  overflow-wrap: anywhere;
+}
+.diff-lines {
+  border-collapse: collapse;
+  width: 100%;
+  font: 12px/1.6 monospace;
+}
+.diff-lines td {
+  vertical-align: top;
+  padding: 1px 6px;
+}
+.diff-code {
+  white-space: pre;
+}
+.line-number {
+  color: #85949c;
+  text-align: right;
+  user-select: none;
+  width: 1%;
+}
+.diff-lines .added {
+  background: #163829;
+}
+.diff-lines .removed {
+  background: #482529;
+}
+.diff-lines .metadata {
+  color: #88b8dc;
+  background: #202c35;
+}
+.review-verdict {
+  border: 1px solid var(--line);
+  padding: 12px;
+  margin: 12px 0;
+  overflow-wrap: anywhere;
+}
+.failed-check summary {
+  color: #ff9e9e;
+}
+@media (min-width: 850px) {
+  .inspector-expanded .diff-browser {
+    grid-template-columns: 260px minmax(0, 1fr);
+  }
+  .inspector-expanded .diff-file-list {
+    max-height: 70vh;
+    position: sticky;
+    top: 80px;
+  }
+}

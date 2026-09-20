@@ -61,7 +61,7 @@ class NativeToolTests(unittest.TestCase):
         for role in ('planner', 'critic', 'reviewer'):
             tools = definitions(role, REQUIRED[role], parallel=True)
             names = {tool['function']['name'] for tool in tools}
-            self.assertEqual(names, {'list_files', 'read_file', 'search', 'finish'})
+            self.assertEqual(names, {'list_files', 'read_file', 'search', 'retrieve_history', 'finish'})
         finish = definitions('planner', REQUIRED['planner'], True)[-1]
         self.assertIn('tasks', finish['function']['parameters']['required'])
 

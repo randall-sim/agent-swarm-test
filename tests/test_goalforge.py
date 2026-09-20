@@ -191,36 +191,42 @@ class EngineTests(unittest.TestCase):
     def test_failing_checks_override_optimistic_reviewer(self):
         state = self.run_engine(replies("3\n"))
         self.assertEqual(state["status"], "budget_exhausted")
-        self.assertEqual(state["history"][-1]["outcome"], "reverted")
+        self.assertEqual(state["history"][-1]["outcome"], "repair_pending")
         self.assertEqual((self.workspace.root / "value.txt").read_text(), "1\n")
         self.assertEqual(state["accepted_commit"], self.initial)
 
     def test_reviewer_can_reject_passing_checks(self):
         state = self.run_engine(replies(accept=False))
-        self.assertEqual(state["history"][-1]["outcome"], "reverted")
+        self.assertEqual(state["history"][-1]["outcome"], "repair_pending")
         self.assertEqual(state["accepted_commit"], self.initial)
+        from goalforge.web import attempt_changes
+        candidate = attempt_changes(self.store, state, 1)
+        self.assertTrue(candidate["available"])
+        self.assertIn("+2", candidate["diff"])
+        self.assertFalse(candidate["review"]["accept"])
+        self.assertEqual(candidate["check_results"][0]["returncode"], 0)
+        self.assertEqual((self.workspace.root / "value.txt").read_text(), "1\n")
 
-    def test_planning_stall_pauses_early_and_can_resume(self):
-        responses = []
-        for i in range(8):
-            responses += [proposal(f"Plan {i}"), {"final": {"approved": False, "reason": "Specify shared errors"}}]
-        state = self.run_engine(responses, iterations=8)
-        self.assertEqual(state["status"], "paused")
-        self.assertEqual(state["attempt"], 3)
-        self.assertEqual(state["usage"]["requests"], 6)
-        self.assertIn("Planning stalled", state["last_error"])
+    def test_planning_fallback_survives_resume(self):
+        rejection = {"final": {"approved": False, "reason": "Specify shared errors"}}
+        state = self.run_engine([proposal("First"), rejection, proposal("Second"), rejection], iterations=2)
+        self.assertEqual(state["status"], "budget_exhausted")
         self.assertEqual(state["accepted_commit"], self.initial)
-        state = self.run_engine(replies())
+        tail = replies()
+        tail[1] = rejection
+        state = self.run_engine(tail)
         self.assertEqual(state["status"], "complete")
-        self.assertNotIn("last_error", state)
+        self.assertEqual(state["attempt"], 3)
+        self.assertIn("advisory", state["history"][-1]["planning_resolution"])
 
     def test_review_feedback_reaches_next_plan_with_checkpoint_restored(self):
         first = replies(accept=False)
         second = replies()
         second[0] = proposal("Revised plan addressing review")
+        second.insert(3, {"tool": "write_file", "args": {"path": "repair_evidence.txt", "content": "Reviewed invariant holds\n"}})
         state = self.run_engine(first + second, iterations=2)
         self.assertEqual(state["status"], "complete")
-        self.assertEqual([h["outcome"] for h in state["history"]], ["reverted", "kept"])
+        self.assertEqual([h["outcome"] for h in state["history"]], ["repair_pending", "kept"])
         events = [json.loads(line) for line in (self.store.root / "events.jsonl").read_text().splitlines()]
         planner = next(e for e in events if e["kind"] == "agent_context" and e["role"] == "planner" and e["attempt"] == 2)
         context = json.loads(planner["messages"][1]["content"])
@@ -237,6 +243,59 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(state["status"], "paused")
         self.assertEqual(state["accepted_commit"], self.initial)
         self.assertEqual(state["last_error"], "Resume later")
+
+    def test_plan_objections_trigger_scoped_single_task_fallback(self):
+        rejection = {"final": {"approved": False, "reason": "B1: API/storage need an agreed return shape"}}
+        responses = [proposal("First"), rejection, proposal("Second"), rejection] + replies()
+        state = self.run_engine(responses, iterations=3)
+        self.assertEqual(state["status"], "complete")
+        events = [json.loads(line) for line in (self.store.root / "events.jsonl").read_text().splitlines()]
+        planner = next(e for e in events if e["kind"] == "agent_context" and e["role"] == "planner" and e["attempt"] == 3)
+        context = json.loads(planner["messages"][1]["content"])
+        self.assertEqual(context["planning"]["max_workers"], 1)
+        self.assertEqual(len(context["planning"]["blockers"]), 2)
+        self.assertIn("return shape", context["planning"]["blockers"][0]["objection"])
+        self.assertTrue(any(e["kind"] == "planning_fallback" for e in events))
+        critic = next(e for e in events if e["kind"] == "agent_context" and e["role"] == "critic")
+        self.assertIn("Approve coherent partial increments", critic["messages"][0]["content"])
+        self.assertIn("NOT a separate testing agent", critic["messages"][0]["content"])
+
+    def test_repeated_critic_veto_becomes_trial_even_for_duplicate_plan(self):
+        rejection = {"final": {"approved": False, "reason": "B1: repeated design objection"}}
+        prefix = [proposal("First"), rejection, proposal("Second"), rejection]
+        for value, accept, expected in [("2\n", True, "kept"), ("3\n", True, "repair_pending"),
+                                         ("2\n", False, "repair_pending")]:
+            with self.subTest(value=value, accept=accept):
+                # Fresh fixture per variant is provided by separate temporary run stores.
+                store = create_run(self.repo, self.root / ("trial-" + str(value.strip()) + str(accept)),
+                                   "Fix value", [[sys.executable, "verify.py"]], ["verify.py"], "", "fake", "https://example.com")
+                workspace = Workspace(Path(store.read()["workspace"]), lambda _: False, protected=["verify.py"])
+                tail = replies(value, accept=accept)
+                tail[0] = proposal("Second")  # Exact repeated proposal must still reach coding.
+                tail[1] = rejection
+                result = Engine(store, ScriptedClient(prefix + tail), workspace, emit=lambda _: None).execute(3)
+                self.assertEqual(result["history"][-1]["outcome"], expected)
+                self.assertFalse(result["history"][-1]["critique"]["approved"])
+                self.assertIn("advisory", result["history"][-1]["planning_resolution"])
+                if expected == "repair_pending":
+                    self.assertEqual(result["accepted_commit"], self.initial)
+                events = [json.loads(line) for line in (store.root / "events.jsonl").read_text().splitlines()]
+                coder = next(e for e in events if e["kind"] == "agent_context" and e["role"] == "coder")
+                context = json.loads(coder["messages"][1]["content"])
+                self.assertEqual(context["plan_review"]["critic_feedback"], rejection["final"])
+
+    def test_fallback_does_not_resurrect_deferred_assignments(self):
+        engine = Engine(self.store, ScriptedClient([]), self.workspace, workers=3, emit=lambda _: None)
+        def task(files):
+            return {"title": "Implement", "approach": "Implement current increment", "acceptance": "Check", "files": files}
+        state = {"accepted_commit": "base", "history": [{"proposal": {"tasks": [task(["tests_extra/test_orders.py"])]}, "outcome": "rejected", "base": "base"}]}
+        current = {"tasks": [task(["storage.py", "api.py", "frontend.py"])]}
+        fixed = engine.preserve_fallback_ownership(current, state)
+        self.assertEqual(fixed, current)
+        self.assertNotIn("tests_extra/test_orders.py", fixed["tasks"][0]["files"])
+        current["tasks"][0]["files"].append("verify.py")
+        with self.assertRaises((ValueError, PermissionError)):
+            engine.preserve_fallback_ownership(current, state)
 
     def test_budget_rollback_and_resume(self):
         state = self.run_engine(replies(), limit=3)

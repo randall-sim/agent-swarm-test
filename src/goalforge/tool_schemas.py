@@ -11,6 +11,11 @@ def object_schema(properties: dict, required: list[str] | None = None) -> dict:
 def definitions(role: str, final_fields: dict, parallel: bool) -> list[dict]:
     text = {"type": "string"}
     specs = [
+        ("retrieve_history", "Retrieve archived evidence only when needed. Earlier attempts only; 0/checks is the initial baseline. Paginate with next_start.",
+         object_schema({"attempt": {"type": "integer", "minimum": 0},
+                        "section": {"type": "string", "enum": ["plan", "review", "checks", "workers", "outcome", "events"]},
+                        "start": {"type": "integer", "minimum": 0},
+                        "count": {"type": "integer", "minimum": 1, "maximum": 12000}})),
         ("list_files", "List files in the actual workspace.", object_schema({})),
         ("read_file", "Read a workspace file before deciding or editing. Lines are numbered.",
          object_schema({"path": text, "start": {"type": "integer", "minimum": 1},
@@ -29,6 +34,16 @@ def definitions(role: str, final_fields: dict, parallel: bool) -> list[dict]:
         ]
     properties = {key: {"type": "boolean" if kind is bool else "string"}
                   for key, kind in final_fields.items()}
+    if role == "planner":
+        properties.update({"increment_kind": {"type": "string", "enum": ["advance", "repair"]},
+                           "reopen_evidence": text, "observable_change": text,
+                           "reopen_source": {"type": "string", "enum": ["none", "current_check", "source_defect", "user_change"]},
+                           "reopen_reference": text, "reopen_observation": text})
+    if role == "critic":
+        properties.update({"blocker_kind": {"type": "string", "enum": ["none", "shared_interface", "ownership", "requirement", "current_defect"]},
+                           "evidence": text})
+    if role == "reviewer":
+        properties.update({key: text for key in ("defects", "remaining_work", "next_increment")})
     if role == "planner" and parallel:
         properties["tasks"] = {"type": "array", "minItems": 1, "items": object_schema({
             "title": text, "approach": text, "acceptance": text,

@@ -143,7 +143,7 @@ class ParallelTests(unittest.TestCase):
 
     def test_failed_combined_check_reverts_both_workers(self):
         state = self.execute(ParallelModel(mode="failed_check"))
-        self.assertEqual(state["history"][-1]["outcome"], "reverted")
+        self.assertEqual(state["history"][-1]["outcome"], "repair_pending")
         self.assertEqual(state["accepted_commit"], self.base)
         for path in ("left.py", "right.py"):
             self.assertEqual((self.workspace.root / path).read_text(), "VALUE = 0\n\n")

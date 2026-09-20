@@ -65,6 +65,34 @@ class WebTests(unittest.TestCase):
         self.app.thread.join(10)
         self.assertFalse(self.app.thread.is_alive())
 
+    def test_request_budget_persists_for_resume_and_can_be_changed(self):
+        # No model calls: inspect the actual Client budget passed to the engine.
+        with patch('goalforge.web.Engine.execute'):
+            status, result = self.request('/api/start', {
+                'goal': 'Fix both modules', 'max_calls': 1000,
+                'workers': 2, 'iterations': 7,
+            })
+            self.assertEqual(status, 200, result)
+            self.finish()
+            run_id = result['id']
+            self.assertEqual(self.app.current_client.budget.limit, 1000)
+            settings = self.request('/api/run?id=' + run_id)[1]['state']['run_settings']
+            self.assertEqual(settings['max_calls'], 1000)
+            self.assertEqual(settings['iterations'], 7)
+            self.assertEqual(settings['workers'], 2)
+            # A fresh app reads the persisted settings, as after a server restart.
+            reopened = WebApp(self.repo, self.root / 'runs', self.app.config)
+            reopened.start({'id': run_id}, resume=True)
+            reopened.thread.join(10)
+            self.assertFalse(reopened.thread.is_alive())
+            self.assertEqual(reopened.current_client.budget.limit, 1000)
+            self.assertEqual(self.request('/api/resume', {
+                'id': run_id, 'max_calls': 250,
+            })[0], 200)
+            self.finish()
+            self.assertEqual(self.app.current_client.budget.limit, 250)
+            self.assertEqual(self.app.store(run_id).read()['run_settings']['max_calls'], 250)
+
     def test_browser_assets_and_api_require_local_authenticated_requests(self):
         status, html = self.request('/')
         self.assertEqual(status, 200)
@@ -92,6 +120,23 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.request('/api/run?id=' + run_id + '&cursor=' + str(snapshot['cursor']))[1]['events'], [])
         self.assertIn('VALUE = 2', self.request('/api/file?id=' + run_id + '&path=left.py')[1]['text'])
         self.assertIn('+VALUE = 2', self.request('/api/diff?id=' + run_id)[1]['diff'])
+        attempt = self.request('/api/diff?id=' + run_id + '&attempt=1')[1]
+        self.assertTrue(attempt['available'])
+        self.assertTrue(attempt['review']['accept'])
+        self.assertIn('+VALUE = 2', attempt['diff'])
+        self.assertEqual(self.request('/api/diff?id=' + run_id + '&attempt=../state')[0], 400)
+        self.assertEqual(self.request('/api/diff?id=' + run_id + '&attempt=99')[0], 400)
+        workspace = Path(snapshot['state']['workspace'])
+        original = (workspace / 'left.py').read_text()
+        (workspace / 'left.py').write_text('UNACCEPTED = 99\n')
+        accepted = self.request('/api/diff?id=' + run_id + '&scope=accepted')[1]['diff']
+        self.assertNotIn('UNACCEPTED', accepted)
+        self.assertIn('+VALUE = 2', accepted)
+        (workspace / 'left.py').write_text(original)
+        (self.app.store(run_id).root / 'attempts' / '1.json').unlink()
+        fallback = self.request('/api/diff?id=' + run_id + '&attempt=1')[1]
+        self.assertIn('Recorded reviewer', fallback['source'])
+        self.assertEqual(fallback['diff'], attempt['diff'])
         patch_status, worker_patch = self.request('/api/patch?id=' + run_id + '&attempt=1&agent=coder-1')
         self.assertEqual(patch_status, 200)
         self.assertTrue(worker_patch['available'])
@@ -102,6 +147,25 @@ class WebTests(unittest.TestCase):
             self.assertEqual(self.request('/api/file?id=' + run_id + '&path=' + path)[0], 400)
         self.assertEqual(self.request('/api/integrate', {'id': run_id})[0], 200)
         self.assertEqual((self.repo / 'left.py').read_text(), 'VALUE = 2\n\n')
+
+    def test_repair_candidate_is_inspectable_but_not_integratable(self):
+        with patch('goalforge.web.Client', return_value=ParallelModel(mode='failed_check')):
+            run_id = self.start()
+            self.finish()
+        candidate = self.request('/api/diff?id=' + run_id + '&scope=candidate')[1]
+        self.assertTrue(candidate['available'])
+        self.assertIn('+VALUE = 99', candidate['diff'])
+        self.assertEqual(candidate['outcome'], 'repair_pending')
+        self.assertEqual(self.request('/api/diff?id=' + run_id + '&scope=accepted')[1]['diff'], '')
+        self.assertEqual(self.request('/api/integrate', {'id': run_id})[0], 400)
+        with patch('goalforge.web.Client', return_value=ParallelModel()):
+            self.assertEqual(self.request('/api/resume', {'id': run_id, 'workers': 2, 'iterations': 1})[0], 200)
+            self.finish()
+        state = self.app.store(run_id).read()
+        self.assertEqual(state['status'], 'complete')
+        self.assertEqual(state['history'][-1]['mode'], 'repair')
+        self.assertNotIn('candidate', state)
+        self.assertFalse(self.request('/api/diff?id=' + run_id + '&scope=candidate')[1]['available'])
 
     def test_approval_can_be_denied_and_pause_unblocks_waiting_run(self):
         with patch('goalforge.web.Client', return_value=ParallelModel(mode='commands')):

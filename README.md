@@ -112,7 +112,7 @@ goalforge run "Fix empty input handling" --repo C:\code\project --check "python 
 
 The agent operates in a new worktree. Your original checkout remains at its original commit. GoalForge prints a run ID, worktree path, branch, phase progress, check results, and final status.
 
-`--check` is required and repeatable. All configured checks must exit zero, without timing out, before a candidate can be kept. Checks run automatically because you explicitly supplied them. A failing baseline is allowed so the agent can fix existing failures; every accepted candidate must pass all checks.
+`--check` is optional and repeatable; omission defaults to unittest discovery in `tests/`. All configured checks must exit zero, without timing out, before a candidate can be kept. Configured or default checks run automatically. A failing baseline is allowed so the agent can fix existing failures; every accepted candidate must pass all checks.
 
 Use `--protect` for acceptance tests, fixtures, or configuration the agent should not change. Paths are repository-relative; directories protect their descendants, and globs are supported. Protecting the entire `tests` directory also prevents adding tests there. To allow new tests while preserving existing ones, protect individual acceptance files instead:
 
@@ -176,7 +176,7 @@ The planner defines exact file ownership and shared interface requirements. The 
 
 Only disjoint file assignments are accepted. File tools enforce ownership; a worker patch touching an unassigned or protected file is rejected even if the change came from an approved command. These checks are workflow controls, not OS sandboxing.
 
-After all workers finish, their patches are applied to the integration worktree in a deterministic order. The complete change must pass all required checks and the reviewer. If a worker fails, integration fails, or combined verification fails, the **whole attempt** is reverted. Earlier accepted iterations stay intact. Individual worker results are not independently accepted or committed.
+After all workers finish, their patches are applied to the integration worktree in a deterministic order. The complete change must pass all required checks and the reviewer. If a worker or integration fails, that incomplete batch is discarded and any previous repair candidate survives. A completed combined implementation that fails verification or review is saved as an **unaccepted repair candidate** for targeted revision. Earlier accepted iterations stay intact. Individual worker results are not independently accepted.
 
 LLM-suggested commands still ask for approval. Requests are queued and presented one at a time on the main thread; output labels identify the requesting worker. Add `--yes` only when you want unattended command execution. Ctrl-C cancels pending work; already-running HTTP requests or commands may need to finish or reach their timeout before cleanup completes.
 
@@ -223,7 +223,7 @@ In PowerShell, replace the copy command with `Copy-Item examples/tiny_project ..
 | Coding agent | Local file and command tools |
 | Centralized knowledge | Durable attempt history injected into later roles |
 | Isolated experiments | An integration worktree plus temporary worktrees for parallel coders |
-| Evaluation and rollback | Required checks plus review, then commit or revert |
+| Evaluation and repair | Required checks plus review; accept verified code or retain an isolated repair candidate |
 
 This adaptation replaces recommender-model training with ordinary software verification and stops at a finite goal. It uses a bounded pool of concurrent coding workers sharing one model, with sequential planning and final review. It does not include distributed training, literature search, or production deployment.
 
@@ -235,7 +235,7 @@ This adaptation replaces recommender-model training with ordinary software verif
 4. **Critique.** A separate read-only role reviews the plan. A rejection becomes a lesson. An exact normalized proposal already tried on the same accepted commit is skipped.
 5. **Implement.** Concurrent coders read and edit their assigned files in separate worktrees created from the last accepted commit. Each receives the common plan and its own task. File edits happen automatically; model commands ask for approval unless `--yes` is set. With `--workers 1`, a single coder edits the integration worktree directly.
 6. **Integrate, verify and review.** Wait for every worker, validate ownership, and apply all worker patches to the integration worktree. Execute your fixed checks. Stage the diff, reject changes to protected/private paths, and ask a fresh reviewer to assess the implementation and evidence. Diffs over 60,000 characters are rejected so the agent must split large changes.
-7. **Keep or revert.** Only passing checks plus reviewer acceptance can keep a change. An accepted batch or partial increment is committed and becomes the next starting point. A rejected attempt restores the last accepted commit and deletes untracked, nonignored files in the agent worktree.
+7. **Accept or repair.** Only passing checks plus reviewer acceptance promote a change to the accepted branch. Completed failed candidates are checkpointed separately and restored for the next repair attempt. At rest the run worktree returns to the accepted commit; unaccepted candidate code remains reachable through private Git refs and saved state.
 8. **Record and continue.** Save the outcome and lesson. Stop when the reviewer marks the full goal complete, the attempt/request limit is reached, an error occurs, or you interrupt execution.
 
 “Complete” means the configured checks passed and the LLM reviewer judged the goal satisfied. It is not a formal correctness guarantee. Choose checks that exercise the behavior you actually want. A reviewer can miss bugs or accept superficial changes; review the resulting branch before integrating it.
@@ -388,8 +388,8 @@ They are coding exercises, not independently hosted browser applications.
 
 Baseline acceptance checks intentionally fail. The planner must define the shared
 internal contract before dispatch; workers implement separate modules against it.
-The reviewer evaluates the combined implementation. Rejections roll back edits and
-send lessons into the next loop; accepted incomplete work can continue from its
+The reviewer evaluates the combined implementation. Failed candidates and feedback
+feed targeted repair attempts; accepted incomplete work continues from its accepted
 checkpoint. Multiple loops are possible, not guaranteed: a correct implementation
 can finish on its first attempt. The reservation demo is the harder stress test.
 The existing `examples/run_parallel_demo.py` command remains available.
@@ -431,9 +431,10 @@ The critic approves an implementation **plan**, while the reviewer evaluates the
 **actual implementation** after coding. Placeholders and failing baseline tests
 are not by themselves grounds for rejecting a plan. Parallel plans must specify
 exact shared symbols, method signatures, return shapes and error behavior before
-workers start. After three consecutive pre-coding plan rejections in one execution,
-GoalForge pauses with a planning-stalled explanation instead of consuming every
-remaining attempt. Inspect the feedback, add guidance, and resume when ready.
+workers start. After two consecutive plan rejections on the same checkpoint,
+GoalForge switches to a single-worker implementation trial with advisory critic
+feedback (see disagreement recovery below). Verification and final review still
+determine whether its changes can be accepted.
 
 If verification commands are blank (or CLI `--check` is omitted), GoalForge defaults to
 `<its Python executable> -m unittest discover -s tests -v` in the run workspace.
@@ -467,3 +468,177 @@ Persistent temporary rate limits pause the run for later resumption; known
 billing/quota errors stop immediately with an actionable message. No raw provider
 error bodies are logged. An individual in-flight HTTP request still has its own
 request timeout. This follows the [OpenAI rate-limit guidance](https://developers.openai.com/api/docs/guides/rate-limits).
+
+### File-by-file changes and review failures
+
+Use the left/right arrows in the context panel to step through model requests.
+The position label shows the request number and total for the selected agent/loop.
+
+**Final changes** opens a file list with addition/deletion counts and a unified,
+line-numbered diff for the selected file. This compares the starting commit to the
+latest accepted commit; unaccepted work is excluded. Expand the panel to put the
+file list beside the diff. Worker diffs use the same viewer.
+
+Select an attempt and click **View attempt changes & review**, or click the
+reviewer node and **Inspect attempt changes & failures**. The viewer shows the
+reviewer's reason, repair guidance, and verification results, with failed command
+output expanded. Files explicitly mentioned in feedback get a Review label;
+these are filename references, not inferred line-level findings.
+
+New combined candidates and check results are saved under
+`~/.goalforge/runs/<run-id>/attempts/<attempt>.json` before review or rollback.
+Rejected edits therefore remain available for inspection even though the working
+files are restored. Older attempts use recorded reviewer input or accepted Git
+commits where available. Attempts that never reached integration, or old runs
+without these records, explicitly report that a combined diff is unavailable.
+
+
+## Targeted repair loop
+
+GoalForge keeps two separate checkpoints: **accepted code** and, when needed, an
+**unaccepted repair candidate**. After coding and verification, a completed candidate
+is saved before the reviewer call. Failing tests or a rejected review no longer
+throw away that implementation. The next planner sees its actual files, latest
+check output (last 12,000 characters per check), worker summary and reviewer feedback,
+and assigns the smallest coherent repair. Coupled API/storage fixes can use one
+worker owning both files; independent repairs can still run in parallel.
+
+All coding workers start from the same candidate checkpoint. The reviewer sees the
+cumulative diff against accepted code, while the attempt diff shows only that
+attempt's edits. Every promotion still requires all configured checks and reviewer
+acceptance. Candidate commits never become ancestors of the accepted commit:
+promotion commits the verified combined tree onto the previous accepted checkpoint.
+Your original checkout is changed only through explicit integration.
+
+Candidates survive budget exhaustion, API failures during review, and process
+restarts. Interrupted individual workers or incomplete integration batches are
+not promoted to candidates; resume uses the last completed saved candidate.
+At rest, the integration worktree and public run branch point at accepted code.
+Use **Repair candidate** in the UI to inspect pending work, and Resume to continue
+repairing it. After three candidate rounds, planning is instructed to reconsider
+architecture/ownership while preserving useful code. Three identical consecutive
+candidate trees pause the run for guidance instead of endlessly repeating repairs.
+Existing request, role-step, attempt and planning-stall limits still apply.
+
+To intentionally abandon pending work, use the **Discard saved repair candidate**
+checkbox when resuming, or:
+
+```sh
+goalforge resume RUN_ID --discard-candidate
+```
+
+The state pointer is cleared; historical candidate refs remain for inspection.
+Candidates live in `refs/goalforge/candidates/<run-id>/attempt-<number>` and are
+tracked in `state.json`. Old runs remain readable; previously discarded code is
+not automatically reconstructed from incomplete or redacted historical logs.
+Restart the server after updating the repair engine.
+
+
+### Scope-aware planning and disagreement recovery
+
+Plans must state CURRENT INCREMENT, DEFERRED WORK, SHARED INTERFACES for the workers
+being dispatched now, and OBJECTION RESPONSES addressing prior critic feedback.
+The critic judges the increment, not whether every future feature has already
+been designed. It may block a deferred requirement only when there is a concrete
+compatibility or dependency problem with the current work. Tests require assigned
+files, not a dedicated testing agent. Full-goal completion remains the reviewer's
+responsibility, and configured verification is never weakened.
+
+The planner receives recent rejected-plan objections explicitly. After two
+consecutive rejections on the same checkpoint, the next plan is limited to one
+coherent task owning the coupled implementation/test files. This is enforced in
+the model tool schema and plan validation, applies across resumes, and is visible
+as a planning fallback event. Private interfaces within that worker's assignment
+can be chosen during implementation. The fallback uses only the current plan's
+single assignment. It does not import file ownership or instructions from older
+rejected plans, which may describe features the current plan deliberately deferred.
+After these two vetoes, critic feedback becomes advisory for the single-worker
+implementation trial and is passed to the coder. The critic's rejection is still
+logged, together with a `planning_trial` event explaining the dispatch decision.
+This deliberately allows a potentially flawed plan to be tested in the isolated
+workspace instead of repeatedly debating it. File protections, verification and
+final reviewer approval still gate acceptance; a failed trial becomes a repair
+candidate. Duplicate-plan detection does not block this trial. Other planning
+failures can still pause the run.
+These rules improve recovery but cannot guarantee model agreement or completion.
+
+### Repair versus advancement
+
+Each attempt receives an explicit `progress` context derived from the latest
+candidate checks and review, or the last accepted increment. Failed checks and
+concrete implementation defects select **repair**. Passing checks with no recorded
+defects select **advance**: the next plan must implement an unmet requirement,
+rather than preserve already-working behavior. Older saved candidates without
+structured reviews select **reassess**, so stale failures are not assumed to persist.
+
+Reviewers separately report `defects`, `remaining_work`, and `next_increment`.
+A sound partial increment is accepted with `complete=false`; unfinished future
+features alone must not cause rejection. Structured contradictory answers are
+returned to the reviewer for correction. Passing tests never override a reported
+implementation defect, and reviewer approval never overrides failing checks.
+Older reply formats remain readable; new native reviewer calls require these fields.
+
+The Decisions panel exposes the next-step context, concrete defects, remaining
+requirements and next increment. Attempts with no file changes are explicitly
+marked, and existing stagnation limits still apply. These checks make the workflow
+clearer but cannot prove that a model's design or review is correct.
+
+When a configured unittest discovery command uses `-s tests`, GoalForge also runs
+it with `-s tests_extra` if that directory contains test files, retaining the same
+interpreter and other flags. Extra-test failures block acceptance. Custom commands
+are unchanged; configure those to cover all relevant suites yourself.
+
+### Active context and historical evidence
+
+Agents start with a compact account of the loaded checkpoint: the goal and user
+constraints, current check statuses (with short failure excerpts only when checks
+fail), the latest accepted capability, current defects/remaining work, and the
+current assignment. The original failing baseline and old plans are no longer
+copied into every prompt. An accepted legacy checkpoint without saved check output
+is marked for reassessment; its original baseline is not treated as current evidence.
+Only unresolved planning blockers and the latest execution/repair lesson are carried
+forward automatically. Interrupted attempts retain their proposal and no longer
+reset the repeated-veto fallback counter.
+
+Every role can call the read-only `retrieve_history` tool when more evidence is
+needed. Supply an earlier attempt number, a section (`plan`, `review`, `checks`,
+`workers`, `outcome`, or `events`), and a character page (`start`, `count`, maximum
+12,000). Attempt `0`, section `checks`, retrieves the original baseline. The result
+includes `next_start` for pagination. Retrieved excerpts enter the conversation as
+tool results and are logged; they do not silently become current facts. Existing
+log/output truncation still applies: retrieval cannot recover data never recorded.
+
+In the agent inspector, **Active context · initial inputs** and **Active context ·
+accumulated during this agent’s work** show the exact selected request. **Archive ·
+not automatically supplied** retains earlier decisions, recorded traces, baseline
+results, and messages pruned from this invocation. Expand these records or search
+their contents without feeding them to the agent. An archived record can overlap
+with an excerpt explicitly retrieved into active context; the active message list
+is authoritative. Older runs retain their original input snapshots rather than
+being retroactively rewritten.
+
+### Evidence for reopening work and progress gates
+
+Planner results declare `increment_kind`, `observable_change`, and reopening
+fields. In advance mode, a proposed repair must explain the violated requirement
+and reference either a currently failing check, exact source text in an existing
+workspace file, or an explicit user instruction. Historical baseline failures are
+not sufficient. This verifies the existence of the cited evidence, not whether the
+model's interpretation is correct; the critic, checks, and reviewer still matter.
+
+New native critic results classify blockers and supply evidence. Missing destination
+files/directories are not valid blockers: workers can create them. A single worker
+owning code and tests cannot be rejected for a cross-worker interface dependency.
+The critic must assess the actual increment, not require implementation of deferred
+features or demand that new tests already exist. Invalid structured decisions receive
+bounded correction feedback before dispatch.
+
+Before candidate promotion/review, the harness compares the attempt to its starting
+checkpoint. Unchanged files and trailing-newline-only changes do not count as an
+increment. Ordinary Python formatting/comment-only edits are detected using equal
+syntax trees; changes to strings, indentation that alters the tree, or tool directives
+are not dismissed as cosmetic. These are conservative checks, not a universal proof
+of semantic equivalence for every file type. Two consecutive `no_progress` attempts
+pause the run, preserving the prior candidate and accepted code. The reviewer also
+receives the attempt-specific diff, so cumulative earlier work cannot masquerade as
+new progress. A larger request budget does not bypass these gates.

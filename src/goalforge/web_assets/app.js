@@ -7,6 +7,7 @@ if (fragment.has("token")) {
 }
 const token = sessionStorage.getItem("goalforge-token") || "";
 let inspectorSignature = "";
+let settingsRun = null;
 let selected = null,
   cursor = 0,
   events = [],
@@ -143,6 +144,37 @@ function inspect(title, sections) {
   inspectorSignature = signature;
   $("detail-title").textContent = title;
   $("detail").replaceChildren();
+  if (title === "Plans & decisions") {
+    const toolbar = node("div", undefined, "row");
+    const status = node("span", "", "small muted");
+    status.setAttribute("role", "status");
+    const copy = button("Copy decisions", async () => {
+      copy.disabled = true;
+      status.textContent = "";
+      try {
+        const text = [
+          title,
+          ...Array.from(
+            $("detail").querySelectorAll(".detail-section"),
+            (section) => section.innerText,
+          ),
+        ].join("\n\n");
+        if (!navigator.clipboard?.writeText)
+          throw new Error(
+            "Clipboard unavailable. Open GoalForge through localhost or HTTPS to copy decisions.",
+          );
+        await navigator.clipboard.writeText(text);
+        status.textContent = "Copied!";
+      } catch (e) {
+        status.textContent =
+          "Could not copy. Check your browser's clipboard permissions and try again.";
+      } finally {
+        copy.disabled = false;
+      }
+    });
+    toolbar.append(copy, status);
+    $("detail").append(toolbar);
+  }
   for (const [name, value] of Object.entries(sections)) {
     if (value === undefined) continue;
     const section = node("section", undefined, "detail-section");
@@ -172,7 +204,10 @@ function searchableContext(section, preference) {
     let matches = 0;
     cards.forEach((card) => {
       card.hidden =
-        !!query && !card.textContent.toLocaleLowerCase().includes(query);
+        !!query &&
+        !(card.textContent + (card.archiveSearch ? card.archiveSearch() : ""))
+          .toLocaleLowerCase()
+          .includes(query);
       if (!card.hidden) matches++;
       if (query) card.open = !card.hidden;
     });
@@ -284,18 +319,31 @@ function contextBrowser(id, attempt) {
     searchableContext(section, preference);
     return section;
   }
-  const picker = document.createElement("select");
-  picker.setAttribute("aria-label", "Agent context request");
-  snapshots.forEach((e, i) => {
-    const option = document.createElement("option");
-    option.value = i;
-    option.textContent = `Loop ${e.attempt ?? "unknown"} · Request ${e.request_number}`;
-    picker.append(option);
-  });
+  let requestIndex =
+    preference.request !== undefined
+      ? Math.min(preference.request, snapshots.length - 1)
+      : snapshots.length - 1;
+  const navigation = node("div", undefined, "request-navigation");
+  const position = node("span");
+  position.setAttribute("aria-live", "polite");
+  const previous = button("←", () => selectRequest(requestIndex - 1));
+  previous.setAttribute("aria-label", "Previous context request");
+  const next = button("→", () => selectRequest(requestIndex + 1));
+  next.setAttribute("aria-label", "Next context request");
+  navigation.append(previous, position, next);
+  function selectRequest(index) {
+    requestIndex = Math.max(0, Math.min(index, snapshots.length - 1));
+    preference.request = requestIndex;
+    show();
+  }
+  section.selectRequest = selectRequest;
   const body = node("div", undefined, "context-pages");
   let applySearch = () => {};
   function show() {
-    const e = snapshots[Number(picker.value)];
+    const e = snapshots[requestIndex];
+    position.textContent = `Loop ${attempt} · Request ${requestIndex + 1} of ${snapshots.length}`;
+    previous.disabled = requestIndex === 0;
+    next.disabled = requestIndex === snapshots.length - 1;
     body.replaceChildren(
       node(
         "p",
@@ -306,12 +354,12 @@ function contextBrowser(id, attempt) {
     );
     const initial = contextGroup(
       body,
-      "Initial inputs",
+      "Active context · initial inputs",
       "Supplied when this agent started: instructions, assignment, and any context passed from earlier agents or attempts.",
     );
     const generated = contextGroup(
       body,
-      "Accumulated during this agent’s work",
+      "Active context · accumulated during this agent’s work",
       "This agent’s earlier messages, tool results, and corrections still included in the selected request.",
     );
     let group = initial;
@@ -382,23 +430,114 @@ function contextBrowser(id, attempt) {
         "GoalForge native tool schemas",
         e.tool_definitions,
       );
+    if (e.context_policy) {
+      body.append(node("p", e.context_policy, "muted small"));
+      group = contextGroup(
+        body,
+        "Archive · not automatically supplied",
+        "Original records remain here. Only the initial inputs and conversation above were sent for this request. Selected excerpts may be active after retrieval; an archive record is not evidence of a current failure.",
+      );
+      function archived(title, value) {
+        const detail = document.createElement("details");
+        detail.className = "context-card";
+        detail.archiveSearch = () => JSON.stringify(value);
+        detail.append(node("summary", title));
+        // Keep large histories lazy so opening the inspector stays responsive.
+        const content = node("div");
+        detail.append(content);
+        let loaded = false;
+        detail.ontoggle = () => {
+          if (detail.open && !loaded) {
+            content.append(readable(value, title));
+            loaded = true;
+          }
+        };
+        group.append(detail);
+      }
+      archived(
+        "Original baseline · historical, not current verification",
+        state?.baseline || [],
+      );
+      for (const h of state?.history || []) {
+        if (h.attempt >= attempt) continue;
+        archived(
+          `Attempt ${h.attempt} · ${h.outcome} · full saved decisions`,
+          h,
+        );
+        const trace = events.filter(
+          (x) => (x.attempt ?? x._attempt) === h.attempt,
+        );
+        archived(
+          `Attempt ${h.attempt} · full recorded agent/tool trace`,
+          trace,
+        );
+      }
+      const active = new Set(e.messages.map((m) => JSON.stringify(m)));
+      const omitted = new Map();
+      for (const previousSnapshot of snapshots.slice(0, requestIndex)) {
+        for (const m of previousSnapshot.messages.slice(2)) {
+          const key = JSON.stringify(m);
+          if (!active.has(key)) omitted.set(key, m);
+        }
+      }
+      if (omitted.size)
+        archived("Earlier messages no longer in this request", [
+          ...omitted.values(),
+        ]);
+    }
     applySearch();
   }
-  picker.value =
-    preference.request !== undefined
-      ? Math.min(preference.request, snapshots.length - 1)
-      : snapshots.length - 1;
-  picker.onchange = () => {
-    preference.request = Number(picker.value);
-    show();
-  };
   show();
-  section.append(picker, body);
+  section.append(navigation, body);
   applySearch = searchableContext(section, preference);
   return section;
 }
 let selectedAgent = null;
+function inspectChecks(trace) {
+  const checks = trace.filter((e) => e.kind === "check").map((e) => e.result);
+  const failed = checks.filter((r) => r.returncode !== 0 || r.timed_out);
+  const pending = Math.max(
+    0,
+    trace.filter((e) => e.kind === "check_started").length - checks.length,
+  );
+  const sections = {
+    "Run / loop": `${selected} · Loop ${viewedAttempt() ?? "unknown"}`,
+    Summary: `${failed.length} failed · ${checks.length - failed.length} passed · ${pending} awaiting results`,
+    "Failed checks": failed.length
+      ? failed.map((r) => (r.argv || []).join(" "))
+      : checks.length
+        ? "No failures in completed checks."
+        : "No completed checks yet.",
+  };
+  // Show every failed command first; never hide an earlier failure behind a later pass.
+  for (const [i, r] of [
+    ...failed,
+    ...checks.filter((r) => r.returncode === 0 && !r.timed_out),
+  ].entries()) {
+    const bad = r.returncode !== 0 || r.timed_out;
+    const names = (r.output || "")
+      .split("\n")
+      .filter((line) => /^(FAIL|ERROR):\s|^FAILED\s/.test(line));
+    sections[`${bad ? "FAIL" : "PASS"} · Check ${i + 1}`] = {
+      argv: r.argv || [],
+      result: r.timed_out ? "Timed out" : `Exit code ${r.returncode}`,
+      ...(bad
+        ? {
+            "Failing tests": names.length
+              ? names
+              : "No individual test names detected; see command output below.",
+          }
+        : {}),
+      output: r.output || "No output recorded.",
+    };
+  }
+  inspect("Checks", sections);
+}
 function inspectAgent(id, title, trace, status, detail) {
+  if (id === "checks") {
+    inspectChecks(trace);
+    return;
+  }
   const matching = trace.filter((e) => e.agent_id === id);
   const final = matching.findLast((e) => e.reply?.final)?.reply.final;
   const report = matching.findLast((e) => e.kind === "worker_finished");
@@ -484,6 +623,14 @@ function inspectAgent(id, title, trace, status, detail) {
   inspect(title, sections);
   if (!$("detail").querySelector(".context-browser"))
     $("detail").prepend(contextBrowser(id, viewedAttempt()));
+  if (id === "reviewer" && !$("detail").querySelector(".review-changes"))
+    $("detail").prepend(
+      button(
+        "Inspect attempt changes & failures",
+        () => openChanges(viewedAttempt()),
+        "review-changes",
+      ),
+    );
   if (report?.patch && id.startsWith("coder-")) {
     const patchButton = button(
       "View this worker’s diff",
@@ -497,12 +644,10 @@ function inspectAgent(id, title, trace, status, detail) {
             encodeURIComponent(id),
         );
         selectedAgent = null;
-        inspect(title + " · changes", {
-          "Implementation summary": report.summary,
-          "Changed files": report.paths,
-          "Worker patch": data.available
-            ? data.patch || "No changes in this patch."
-            : "The worker patch is not available yet.",
+        renderDiff(title + " · changes", {
+          diff: data.patch,
+          available: data.available,
+          source: report.summary,
         });
       },
       "worker-diff",
@@ -538,16 +683,14 @@ function inspectEvent(index) {
     $("detail").querySelector(".context-browser")?.remove();
     const browser = contextBrowser(event.agent_id, event.attempt);
     $("detail").prepend(browser);
-    const picker = browser.querySelector("select");
-    if (picker) {
+    if (browser.selectRequest) {
       const snapshots = events.filter(
         (e) =>
           e.kind === "agent_context" &&
           e.agent_id === event.agent_id &&
           e.attempt === event.attempt,
       );
-      picker.value = snapshots.indexOf(event);
-      picker.onchange();
+      browser.selectRequest(snapshots.indexOf(event));
     }
     return;
   }
@@ -584,6 +727,16 @@ function label(e) {
       provider_request: e.retry
         ? `Retrying API request (${e.retry})`
         : "Calling model",
+      progress_selected: "Next step selected from current evidence",
+      no_progress: "No code changes made this attempt",
+      planning_fallback: "Planning simplified to one coherent task",
+      planning_trial:
+        "Single-worker trial; critic feedback advisory, final review required",
+      candidate_saved: "Saved unaccepted repair candidate",
+      candidate_restored: "Restored candidate for targeted repair",
+      repair_required: "Implementation needs repair; candidate retained",
+      repair_stalled: "Repair paused: no code progress",
+      candidate_cleared: "Repair candidate cleared",
       role_started: "Started",
       role_finished: "Finished",
       worker_started: "Task assigned",
@@ -649,7 +802,11 @@ function renderAttemptNavigation() {
     chooseAttempt(attempts[attempts.indexOf(viewedAttempt()) + 1]),
   );
   next.disabled = attempts.indexOf(viewedAttempt()) >= attempts.length - 1;
-  nav.append(previous, picker, next);
+  const changes = button("View attempt changes & review", () =>
+    openChanges(viewedAttempt()),
+  );
+  changes.disabled = viewedAttempt() === 0;
+  nav.append(previous, picker, next, changes);
 }
 function renderActivity() {
   if (renderedAttempt !== viewedAttempt()) {
@@ -801,21 +958,34 @@ function renderGraph() {
       ["role_finished", "worker_finished", "integration", "check"].includes(
         last.kind,
       );
+    const decision = matching.findLast((e) => e.reply?.final)?.reply.final;
+    const rejected =
+      (id === "reviewer" && decision?.accept === false) ||
+      (id === "critic" && decision?.approved === false);
     const failed =
-      last &&
-      (last.kind === "worker_failed" ||
-        (last.kind === "check" &&
-          (last.result.returncode !== 0 || last.result.timed_out)));
+      (id === "checks" &&
+        matching.some(
+          (e) =>
+            e.kind === "check" &&
+            (e.result.returncode !== 0 || e.result.timed_out),
+        )) ||
+      rejected ||
+      (last &&
+        (last.kind === "worker_failed" ||
+          (last.kind === "check" &&
+            (last.result.returncode !== 0 || last.result.timed_out))));
     const isActive = liveAttempt && last && !finished && !failed;
-    const status = failed
-      ? "Failed"
-      : finished
-        ? "Done"
-        : isActive
-          ? "Running"
-          : last
-            ? "Stopped"
-            : "Waiting";
+    const status = rejected
+      ? "Rejected"
+      : failed
+        ? "Failed"
+        : finished
+          ? "Done"
+          : isActive
+            ? "Running"
+            : last
+              ? "Stopped"
+              : "Waiting";
     const b = button(
       "",
       () => {
@@ -915,6 +1085,7 @@ async function listRuns() {
 }
 async function selectRun(id) {
   selected = id;
+  settingsRun = null;
   renderedAttempt = null;
   selectedAttempt = null;
   cursor = 0;
@@ -939,6 +1110,13 @@ async function poll() {
     );
     if (selected !== id) return;
     state = data.state;
+    if (settingsRun !== id) {
+      const settings = state.run_settings || {};
+      $("resume-calls").value = settings.max_calls ?? 80;
+      $("resume-workers").value = settings.workers ?? state.workers ?? 3;
+      $("resume-iterations").value = settings.iterations ?? 5;
+      settingsRun = id;
+    }
     running = data.running;
     cursor = data.cursor;
     let eventAttempt = events.at(-1)?._attempt ?? 0;
@@ -955,6 +1133,8 @@ async function poll() {
     $("meta").textContent =
       `${state.repo}\nWorkspace: ${state.workspace} · ${state.model} · ${(data.live_usage || state.usage).requests || 0} requests · ${(data.live_usage || state.usage).input_tokens || 0} input / ${(data.live_usage || state.usage).output_tokens || 0} output tokens`;
     $("meta").style.whiteSpace = "pre-wrap";
+    $("show-candidate").hidden = !state.candidate;
+    $("discard-candidate").disabled = running || !state.candidate;
     $("pause").disabled = !running || data.stopping;
     $("integrate").disabled =
       running || state.accepted_commit === state.start_commit;
@@ -1041,8 +1221,10 @@ $("followup-form").onsubmit = async (e) => {
       workers: +$("resume-workers").value,
       max_calls: +$("resume-calls").value,
       iterations: +$("resume-iterations").value,
+      discard_candidate: $("discard-candidate").checked,
     });
     $("followup").value = "";
+    $("discard-candidate").checked = false;
     await poll();
   } catch (e) {
     error(e);
@@ -1075,7 +1257,18 @@ $("show-history").onclick = () => {
       sections[prefix + "workers"] = attempt.workers
         .map((w) => w.agent_id + ": " + w.summary)
         .join("\n\n");
-    if (attempt.review) sections[prefix + "reviewer"] = attempt.review.reason;
+    if (attempt.progress)
+      sections[prefix + "next-step context"] = attempt.progress;
+    if (attempt.review) {
+      sections[prefix + "reviewer"] = attempt.review.reason;
+      sections[prefix + "defects"] = attempt.review.defects;
+      sections[prefix + "remaining requirements"] =
+        attempt.review.remaining_work;
+      sections[prefix + "next increment"] = attempt.review.next_increment;
+    }
+    if (attempt.changed_code === false)
+      sections[prefix + "progress"] =
+        "No code changes relative to the loaded checkpoint";
     sections[prefix + "lesson"] = attempt.lesson;
   }
   if (!state.history.length)
@@ -1083,19 +1276,197 @@ $("show-history").onclick = () => {
       "No completed attempts yet. Click the live planner or critic actions to inspect decisions.";
   inspect("Plans & decisions", sections);
 };
-$("show-diff").onclick = async () => {
+function diffFiles(diff) {
+  const files = [];
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("diff --git "))
+      files.push({
+        name: / b\/(.*)$/.exec(line)?.[1] || line.slice(11),
+        lines: [],
+        added: 0,
+        removed: 0,
+      });
+    const file = files.at(-1);
+    if (!file) continue;
+    file.lines.push(line);
+    if (line.startsWith("+++ ") && line !== "+++ /dev/null")
+      file.name = line.slice(4).replace(/^b\//, "");
+    else if (line.startsWith("--- ") && line !== "--- /dev/null")
+      file.name = line.slice(4).replace(/^a\//, "");
+    if (line.startsWith("+") && !line.startsWith("+++")) file.added++;
+    if (line.startsWith("-") && !line.startsWith("---")) file.removed++;
+  }
+  return files;
+}
+function renderDiff(title, data) {
+  selectedAgent = null;
+  selectedEvent = null;
+  inspectorSignature = "";
+  $("detail-title").textContent = title;
+  const host = $("detail");
+  host.replaceChildren(node("p", data.source || "", "muted small"));
+  const review = data.review;
+  const verdict = node("section", undefined, "review-verdict");
+  if (data.attempt) {
+    verdict.append(node("h3", `Attempt ${data.attempt} · ${data.outcome}`));
+    if (review) {
+      verdict.append(
+        node(
+          "strong",
+          review.accept
+            ? "Reviewer accepted the implementation"
+            : "Reviewer rejected the implementation",
+        ),
+      );
+      verdict.append(node("p", review.reason));
+      verdict.append(
+        node("h4", "Repair guidance"),
+        node("p", review.lesson || "No repair guidance recorded."),
+      );
+    } else if (data.critique?.approved === false) {
+      verdict.append(
+        node("strong", "Plan rejected before coding"),
+        node("p", data.critique.reason),
+      );
+    } else
+      verdict.append(
+        node("p", "No completed reviewer decision recorded for this attempt."),
+      );
+    if (data.lesson && data.lesson !== review?.lesson)
+      verdict.append(node("p", data.lesson));
+    for (const check of data.check_results || []) {
+      const failed = check.returncode !== 0 || check.timed_out;
+      const detail = document.createElement("details");
+      detail.open = failed;
+      detail.className = failed ? "failed-check" : "";
+      detail.append(
+        node(
+          "summary",
+          `${failed ? "FAIL" : "PASS"} · ${(check.argv || []).join(" ")}`,
+        ),
+        node("pre", check.output || "No output recorded."),
+      );
+      verdict.append(detail);
+    }
+    host.append(verdict);
+  }
+  if (data.truncated)
+    host.append(
+      node(
+        "p",
+        "Diff truncated at 200,000 characters; some changes may be omitted.",
+        "attempt-outcome",
+      ),
+    );
+  const files = diffFiles(data.diff || "");
+  if (!files.length) {
+    host.append(
+      node(
+        "p",
+        data.available === false
+          ? "No saved combined diff is available. See the attempt outcome above or inspect individual workers."
+          : "No file changes in this diff.",
+      ),
+    );
+    return;
+  }
+  const layout = node("div", undefined, "diff-browser");
+  const list = node("nav", undefined, "diff-file-list");
+  list.setAttribute("aria-label", "Changed files");
+  const pane = node("section", undefined, "diff-file-content");
+  const feedback = [review?.reason, review?.lesson, data.lesson]
+    .filter(Boolean)
+    .join(" ");
+  function selectFile(file, control) {
+    list
+      .querySelectorAll("button")
+      .forEach((b) => b.setAttribute("aria-pressed", String(b === control)));
+    pane.replaceChildren(
+      node("h3", file.name),
+      node("p", `+${file.added} −${file.removed}`, "small"),
+    );
+    if (feedback.includes(file.name))
+      pane.append(
+        node(
+          "p",
+          "This file is mentioned in the review feedback above. The reviewer did not supply line-level annotations.",
+          "attempt-outcome",
+        ),
+      );
+    const table = node("table", undefined, "diff-lines");
+    table.setAttribute("aria-label", "Unified diff for " + file.name);
+    let oldLine = null,
+      newLine = null;
+    for (const line of file.lines) {
+      const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      let left = "",
+        right = "",
+        type = "metadata";
+      if (hunk) {
+        oldLine = Number(hunk[1]);
+        newLine = Number(hunk[2]);
+      } else if (oldLine !== null) {
+        if (line.startsWith("+")) {
+          right = newLine++;
+          type = "added";
+        } else if (line.startsWith("-")) {
+          left = oldLine++;
+          type = "removed";
+        } else if (line.startsWith(" ")) {
+          left = oldLine++;
+          right = newLine++;
+          type = "unchanged";
+        }
+      }
+      const row = node("tr", undefined, type);
+      row.append(
+        node("td", left, "line-number"),
+        node("td", right, "line-number"),
+        node("td", line, "diff-code"),
+      );
+      table.append(row);
+    }
+    pane.append(table);
+  }
+  for (const file of files) {
+    const control = button(
+      `${file.name}  +${file.added} −${file.removed}${feedback.includes(file.name) ? " · Review" : ""}`,
+      () => selectFile(file, control),
+    );
+    control.setAttribute("aria-pressed", "false");
+    list.append(control);
+  }
+  layout.append(list, pane);
+  host.append(layout);
+  const first = Math.max(
+    0,
+    files.findIndex((file) => file.added || file.removed),
+  );
+  selectFile(files[first], list.children[first]);
+}
+async function openChanges(attempt = null) {
+  const id = selected;
+  const data = await api(
+    "diff?id=" +
+      encodeURIComponent(id) +
+      (attempt === null ? "&scope=accepted" : "&attempt=" + attempt),
+  );
+  if (selected !== id) return;
+  renderDiff(
+    attempt === null
+      ? "Final accepted changes"
+      : `Attempt ${attempt} · changes & review`,
+    data,
+  );
+}
+$("show-diff").onclick = () => openChanges().catch(error);
+$("show-candidate").onclick = async () => {
   try {
-    selectedEvent = null;
-    selectedAgent = null;
-    const data = await api("diff?id=" + encodeURIComponent(selected));
-    inspect("Workspace changes", {
-      "Diff from starting commit":
-        data.diff ||
-        "No integrated changes yet. During coding, inspect worker write_file actions.",
-      ...(data.truncated
-        ? { Notice: "Diff truncated to 200,000 characters" }
-        : {}),
-    });
+    const id = selected;
+    const data = await api(
+      "diff?id=" + encodeURIComponent(id) + "&scope=candidate",
+    );
+    if (selected === id) renderDiff("Unaccepted repair candidate", data);
   } catch (e) {
     error(e);
   }
@@ -1186,7 +1557,8 @@ $("folder-cancel").onclick = () => $("folder-dialog").close();
 (async () => {
   try {
     const config = await api("config");
-    $("server-update").hidden = config.context_capture_version >= 1;
+    $("server-update").hidden =
+      config.context_capture_version >= 1 && config.repair_loop_version >= 1;
     $("repo").value = config.repo;
     $("model").value = config.model;
     if (!config.key_configured)

@@ -9,11 +9,47 @@ import threading
 from urllib.parse import parse_qs, urlsplit
 import webbrowser
 
+from .repair import clear_candidate
 from .verification import verification_commands
 from .engine import Engine
 from .provider import Budget, Client
 from .state import Store, create_run, git
 from .workspace import Workspace
+
+
+def attempt_changes(store, state, attempt):
+    if attempt < 1 or attempt > state['attempt']:
+        raise ValueError('Invalid attempt')
+    history = next((h for h in state['history'] if h['attempt'] == attempt), {})
+    path = store.root / 'attempts' / f'{attempt}.json'
+    candidate = json.loads(path.read_text()) if path.is_file() else None
+    source = 'Changes made in this attempt from its starting checkpoint; review assesses the cumulative candidate'
+    # Earlier versions recorded the reviewer input but did not save a separate candidate.
+    if candidate is None:
+        events = store.root / 'events.jsonl'
+        if events.is_file():
+            with events.open() as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                        if event.get('kind') == 'agent_context' and event.get('role') == 'reviewer' and event.get('attempt') == attempt:
+                            context = json.loads(event['messages'][1]['content'])
+                            if 'diff' in context:
+                                candidate = context
+                                source = 'Recorded reviewer input from this attempt'
+                                break
+                    except (ValueError, KeyError, IndexError, TypeError):
+                        continue
+    if candidate is None and history.get('outcome') == 'kept' and history.get('base') and history.get('commit'):
+        candidate = {'diff': git(Path(state['workspace']), 'diff', '--no-ext-diff', '--no-textconv', history['base'], history['commit'], '--', strip=False)}
+        source = 'Accepted commit compared with this attempt’s starting commit'
+    available = candidate is not None
+    diff = (candidate or {}).get('diff', '')
+    return store.redact(dict(diff=diff[:200000], truncated=len(diff)>200000, available=available,
+                             attempt=attempt, source=source if available else 'No combined candidate was saved for this attempt. It may have stopped before integration, or predate snapshot recording.',
+                             outcome=history.get('outcome', 'in progress'), review=history.get('review'),
+                             critique=history.get('critique'), lesson=history.get('lesson'),
+                             check_results=(candidate or {}).get('check_results', [])))
 
 
 class WebApp:
@@ -76,8 +112,11 @@ class WebApp:
             key = self.config.get('LLM_API_KEY')
             if not key:
                 raise ValueError('Set LLM_API_KEY in the server .env file, then restart the server.')
+            store = self.store(data.get('id')) if resume else None
+            prior = store.read() if store else {}
+            saved_settings = prior.get('run_settings', {})
             def number(name, default, maximum):
-                value = data.get(name, default)
+                value = data.get(name, saved_settings.get(name, default))
                 if isinstance(value, bool):
                     raise ValueError(f'Invalid {name}')
                 value = int(value)
@@ -91,8 +130,6 @@ class WebApp:
             instructions = str(data.get('instructions', '')).strip()
             if len(instructions) > 16000:
                 raise ValueError('Instructions must be under 16,000 characters')
-            store = self.store(data.get('id')) if resume else None
-            prior = store.read() if store else {}
             model = str(data.get('model') or self.config.get('LLM_MODEL') or prior.get('model', ''))
             base = self.config.get('LLM_BASE_URL') or prior.get('base_url')
             if not model or not base:
@@ -110,6 +147,8 @@ class WebApp:
                         prior['goal'] = goal
                         prior['status'] = 'ready'
                         store.event('user_instruction', text=instructions)
+                    if data.get('discard_candidate') is True:
+                        clear_candidate(store, prior, 'Explicitly discarded before resume')
                     prior.update(model=model, base_url=base)
                     store.write(prior)
             else:
@@ -125,6 +164,9 @@ class WebApp:
                                    instructions or 'Follow existing project conventions. Make focused, maintainable changes.', model, base)
             store.secret = key
             state = store.read()
+            state['run_settings'] = dict(max_calls=calls, workers=workers,
+                                         iterations=iterations, role_steps=steps)
+            store.write(state)
             self.cancelled = threading.Event()
             self.active = state['id']
             self.current_client = client
@@ -252,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == '/api/config':
                 return self.respond(dict(repo=str(app.repo), model=app.config.get('LLM_MODEL', ''),
                                          key_configured=bool(app.config.get('LLM_API_KEY')),
-                                         context_capture_version=1))
+                                         context_capture_version=1, repair_loop_version=1))
             if url.path == '/api/runs':
                 runs = []
                 for p in sorted(app.runs.glob('*/state.json'), reverse=True):
@@ -288,6 +330,19 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(workspace.files())
                 if url.path == '/api/file':
                     return self.respond(store.redact(workspace.execute('read_file', dict(path=arg('path'), start=int(arg('start','1')), count=500), False)))
+                if arg('attempt'):
+                    return self.respond(attempt_changes(store, state, int(arg('attempt'))))
+                if arg('scope') == 'candidate':
+                    candidate = state.get('candidate')
+                    if not candidate:
+                        return self.respond(dict(diff='', available=False, source='No pending repair candidate'))
+                    diff = git(workspace.root, 'diff', '--no-ext-diff', '--no-textconv', state['accepted_commit'], candidate['commit'], '--', strip=False)
+                    return self.respond(store.redact(dict(diff=diff[:200000], truncated=len(diff)>200000,
+                        available=True, attempt=candidate['attempt'], outcome='repair_pending', review=candidate.get('review'),
+                        check_results=candidate['checks'], source='Saved unaccepted repair candidate; resume continues from this code')))
+                if arg('scope') == 'accepted':
+                    diff = git(workspace.root, 'diff', '--no-ext-diff', '--no-textconv', state['start_commit'], state['accepted_commit'], '--', strip=False)
+                    return self.respond(store.redact(dict(diff=diff[:200000], truncated=len(diff)>200000, available=True, source='Accepted changes from the starting commit; excludes unaccepted work')))
                 diff = git(workspace.root, 'diff', '--no-ext-diff', '--no-textconv', state['start_commit'], '--', strip=False)
                 return self.respond(store.redact(dict(diff=diff[:200000], truncated=len(diff)>200000)))
             self.respond({'error': 'Not found'}, 404)

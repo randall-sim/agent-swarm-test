@@ -38,9 +38,10 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--check", action="append", default=[], help="Verification command; repeat for multiple checks (default: Python unittest discovery in tests/)")
     run.add_argument("--protect", action="append", default=[], help="Repository-relative path or glob which must not change")
     run.add_argument("--directive", type=Path, help="Text file containing coding conventions and constraints")
-    for command in (run, sub.add_parser("resume", help="Continue from the last accepted checkpoint")):
+    for command in (run, sub.add_parser("resume", help="Continue from the saved repair candidate or accepted checkpoint")):
         if command is not run:
             command.add_argument("run_id")
+            command.add_argument("--discard-candidate", action="store_true", help="Resume from accepted code instead of the saved repair candidate")
         command.add_argument("--runs-dir", type=Path, default=None)
         command.add_argument("--model", default=None, help="Your provider's model ID (or LLM_MODEL)")
         command.add_argument("--base-url", default=None, help="Chat Completions API base URL, usually ending /v1")
@@ -88,6 +89,8 @@ def report(state: dict) -> None:
     print(f"Coding worker limit: {state.get('workers', 1)}")
     print(f"Branch: {state['branch']}\nWorkspace: {state['workspace']}")
     print(f"Accepted commit: {state['accepted_commit']}\nUsage: {json.dumps(state['usage'])}")
+    if state.get("candidate"):
+        print(f"Unaccepted repair candidate: {state['candidate']['commit']} (from attempt {state['candidate']['attempt']}); resume continues repairs")
     if state.get("last_error") and state["status"] in {"error", "paused", "budget_exhausted"}:
         print("Last stop: " + state["last_error"])
     if state["status"] != "complete":
@@ -165,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
               ("are authorized by --yes." if args.yes else "require approval."))
         workspace = Workspace(Path(state["workspace"]), approve, args.timeout, state["protected"], key)
         emit(f"Coding worker limit: {workers} (one shared request budget)")
-        result = Engine(store, client, workspace, args.role_steps, emit, workers=workers).execute(args.iterations)
+        result = Engine(store, client, workspace, args.role_steps, emit, workers=workers).execute(args.iterations, discard_candidate=getattr(args, "discard_candidate", False))
         report(result)
         return 0 if result["status"] == "complete" else (1 if result["status"] == "error" else 2)
     except (OSError, ValueError, RuntimeError) as exc:

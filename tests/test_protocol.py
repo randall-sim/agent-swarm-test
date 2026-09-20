@@ -14,10 +14,12 @@ class Replies:
         self.replies = iter(replies)
         self.budget = Budget(12)
         self.messages = []
+        self.schemas = []
 
     def complete(self, messages, **kwargs):
         self.budget.reserve()
         self.messages.append(list(messages))
+        self.schemas.append(kwargs.get("tools"))
         value = next(self.replies)
         if isinstance(value, Exception):
             raise value
@@ -118,3 +120,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn('Planner', snapshots[0]['sources']['proposal'])
         self.assertIn('Shared shape', snapshots[1]['messages'][-1]['content'])
         self.assertIn('Fix shape mismatch', snapshots[1]['messages'][1]['content'])
+
+
+    def test_deadlock_fallback_enforces_single_task_in_schema_and_validation(self):
+        plan = json.loads((Path(__file__).parent / 'fixtures' / 'planner_unwrapped.json').read_text())
+        single = {**plan, 'tasks': [plan['tasks'][0]]}
+        engine = self.engine([plan, single], workers=3)
+        result = engine.role('planner', {'attempt': 3, 'max_workers': 1,
+                                        'planning': {'max_workers': 1, 'blockers': []}})
+        self.assertEqual(len(result['tasks']), 1)
+        self.assertEqual(engine.client.budget.used, 2)
+        self.assertEqual(engine.client.schemas[0][-1]['function']['parameters']['properties']['tasks']['maxItems'], 1)
+        self.assertIn('between 1 and 1', engine.client.messages[1][-1]['content'])
+        self.assertIn('DEFERRED WORK', engine.client.messages[0][0]['content'])

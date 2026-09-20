@@ -29,6 +29,10 @@ all exception classes and their defining module; "choose a shared exception voca
 a contract. Every affected task must reference the same decisions. A contract file written by
 one parallel worker is not visible to others until integration, so the proposal must contain
 all decisions they need. If this cannot be decided now, use a single worker for coupled changes.
+Only specify shared contracts needed for THIS increment. List future features as deferred work;
+do not expand the increment just to satisfy a full-goal design checklist. Respect max_workers even
+when it is lower than the run's configured capacity. With max_workers=1, give one worker all coupled
+implementation and test files; no parallel interface agreement is needed inside that one task.
 Do not assign tasks that depend on another worker finishing first: do that work in a later
 iteration instead. Use one task for tightly coupled work. Never invent work just to fill slots.
 Include test files in the owning task when new tests are needed. Do not assign protected paths.
@@ -97,6 +101,7 @@ def implement_parallel(engine: Engine, state: dict, context: dict, item: dict) -
     from .engine import Engine
 
     tasks = validate_tasks(context["proposal"], engine.workspace, engine.workers)
+    worker_base = (state.get("candidate") or {}).get("commit", state["accepted_commit"])
     cancelled = Event()
     approvals = Queue()
     prepared = []
@@ -113,7 +118,7 @@ def implement_parallel(engine: Engine, state: dict, context: dict, item: dict) -
             # Persist the path before creating its worktree, so resume can recover it.
             state.setdefault("worker_paths", []).append(str(path))
             engine.store.write(state)
-            git(Path(state["repo"]), "worktree", "add", "--detach", str(path), state["accepted_commit"])
+            git(Path(state["repo"]), "worktree", "add", "--detach", str(path), worker_base)
             def approve(argv, worker_id=agent_id):
                 done, answer = Event(), []
                 approvals.put((worker_id, argv, done, answer))
@@ -141,7 +146,7 @@ def implement_parallel(engine: Engine, state: dict, context: dict, item: dict) -
                 if cancelled.is_set():
                     raise WorkerCancelled("Another worker stopped the attempt")
                 root = worker.workspace.root
-                if git(root, "rev-parse", "HEAD") != state["accepted_commit"] or git(root, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD":
+                if git(root, "rev-parse", "HEAD") != worker_base or git(root, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD":
                     raise RuntimeError("Worker changed Git HEAD or branch")
                 git(root, "add", "-A")
                 paths = [p for p in git(root, "diff", "--cached", "--name-only", "-z").split("\0") if p]

@@ -33,7 +33,7 @@
       <div id="error" role="alert" hidden></div>
       <p id="server-update" class="attempt-outcome" role="status" hidden>
         Server update required: restart GoalForge in your terminal to enable
-        agent context recording and the corrected planning loop. Refreshing the
+        saved repair candidates and the latest engine changes. Refreshing the
         page alone does not reload the Python engine.
       </p>
       <section id="composer">
@@ -124,7 +124,8 @@
         <div class="run-meta" id="meta"></div>
         <div class="toolbar">
           <button id="pause">Pause run</button
-          ><button id="show-diff">View changes</button
+          ><button id="show-diff">Final changes</button
+          ><button id="show-candidate" hidden>Repair candidate</button
           ><button id="show-files">Browse files</button
           ><button id="show-history">Decisions</button
           ><button id="integrate">Apply to original folder</button>
@@ -152,8 +153,9 @@
             ></textarea>
           </label>
           <p class="muted small">
-            Uses the worker count and budgets below. Pause an active run before
-            sending instructions.
+            Uses the saved run settings below. The request budget applies to
+            each start or resume. Pause an active run before sending
+            instructions.
           </p>
           <div class="grid">
             <label
@@ -179,6 +181,10 @@
                 value="5"
             /></label>
           </div>
+          <label
+            ><input type="checkbox" id="discard-candidate" /> Discard saved
+            repair candidate and restart from accepted code</label
+          >
           <button id="resume" class="primary">Send / resume</button>
         </form>
       </section>
