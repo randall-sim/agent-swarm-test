@@ -1,13 +1,16 @@
-"""Sequential role calls with durable memory and external acceptance gates."""
+"""Knowledge-driven orchestration with isolated parallel coding workers."""
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import Event
 from typing import Callable
 
+from .tool_schemas import definitions
 from .provider import BudgetExceeded, Client, ProviderError
 from .state import Store, fingerprint, git, rollback
 from .workspace import OUTPUT_LIMIT, Workspace, run_process, sensitive
+from .swarm import PARALLEL_PLANNER, WorkerCancelled, cleanup_workers, implement_parallel, validate_tasks
 
 
 PROTOCOL = '''You are a role in GoalForge, a coding assistant. Work only toward the user's goal.
@@ -54,43 +57,134 @@ REQUIRED = {
 }
 
 
+def decode_reply(name: str, reply: dict) -> tuple[str, dict]:
+    """Accept one unambiguous action; tolerate only a missing final envelope."""
+    if not isinstance(reply, dict):
+        raise ValueError("Response must be a JSON object")
+    if "tool" in reply:
+        if "final" in reply or any(key in reply for key in REQUIRED[name]):
+            raise ValueError("Send either a tool request or a final answer, never both")
+        if not isinstance(reply["tool"], str) or not reply["tool"]:
+            raise ValueError("tool must be a nonempty string")
+        if not isinstance(reply.get("args", {}), dict):
+            raise ValueError("args must be a JSON object")
+        return "tool", reply
+    final = reply.get("final") if "final" in reply else reply
+    if not isinstance(final, dict):
+        raise ValueError("final must contain a JSON object")
+    errors = [f"{key} must be {kind.__name__}" for key, kind in REQUIRED[name].items()
+              if type(final.get(key)) is not kind]
+    if errors:
+        raise ValueError("Invalid final answer: " + "; ".join(errors))
+    return "final", final
+
+
 class Engine:
     def __init__(self, store: Store, client: Client, workspace: Workspace,
-                 steps: int = 12, emit: Callable[[str], None] = print):
+                 steps: int = 12, emit: Callable[[str], None] = print, workers: int = 1,
+                 agent_id: str | None = None, cancelled: Event | None = None):
         self.store, self.client, self.workspace = store, client, workspace
+        if not 1 <= workers <= 8:
+            raise ValueError("workers must be between 1 and 8")
         self.steps, self.emit = steps, emit
+        self.workers, self.agent_id = workers, agent_id
+        self.cancelled = cancelled or Event()
 
     def role(self, name: str, context: dict) -> dict:
-        self.emit(f"  {name}...")
-        messages = [{"role": "system", "content": PROTOCOL + "\n" + ROLES[name]},
+        label = self.agent_id or name
+        self.emit(f"[{label}] START {name}")
+        self.store.event("role_started", agent_id=label, role=name, attempt=context.get("attempt"))
+        native = getattr(self.client, "native_tools", False)
+        protocol = PROTOCOL
+        if native:
+            protocol = protocol.replace("Return exactly one JSON object per response, without prose or Markdown fences.",
+                                        "Use the provided native function tools. The application executes each call and returns its result.")
+            protocol = protocol.replace('To use a tool: {"tool":"NAME","args":{...}}.',
+                                        "Call a named function such as read_file or write_file directly.")
+            protocol = protocol.replace('''To finish: {"final":{...}} matching your role's requested fields. Booleans must be JSON booleans.''',
+                                        "To finish, call the finish function with your role's requested fields.")
+        prompt = protocol + "\n" + ROLES[name]
+        if name == "planner" and self.workers > 1:
+            prompt += PARALLEL_PLANNER
+        if name == "critic" and self.workers > 1:
+            prompt += "\nCheck that tasks are independently implementable from the same base, with explicit shared interfaces. Reject hidden dependencies between simultaneous workers."
+        example = {key: (False if kind is bool else "...") for key, kind in REQUIRED[name].items()}
+        if name == "planner" and self.workers > 1:
+            example["tasks"] = [{"title": "...", "approach": "...", "acceptance": "...", "files": ["relative/file.py"]}]
+        final_example = json.dumps({"final": example})
+        if not native:
+            prompt += "\nFinal response shape (replace example values with your answer): " + final_example
+        schema = definitions(name, REQUIRED[name], self.workers > 1)
+        messages = [{"role": "system", "content": prompt},
                     {"role": "user", "content": json.dumps(context, ensure_ascii=False)}]
+        invalid_streak = 0
+        tool_calls = 0
+
+        def append_exchange(reply: dict, text: str) -> None:
+            if "_native_message" in reply:
+                messages.extend([reply["_native_message"], {"role": "tool",
+                                 "tool_call_id": reply["_native_call_id"], "content": text}])
+            else:
+                messages.extend([{"role": "assistant", "content": json.dumps(reply, ensure_ascii=False)},
+                                 {"role": "user", "content": text}])
+
+        def reject(reason: str, reply: dict | None = None) -> None:
+            nonlocal invalid_streak
+            invalid_streak += 1
+            self.store.event("response_rejected", agent_id=label, role=name,
+                             attempt=context.get("attempt"), reason=reason, consecutive=invalid_streak)
+            self.emit(f"[{label}] Invalid response {invalid_streak}/3: {reason}")
+            if invalid_streak >= 3:
+                raise ProviderError(f"{label} returned 3 consecutive invalid responses; stopping to avoid wasting calls. Last error: {reason}")
+            correction = (reason + "\nUse the provided file functions; call finish only when done." if native else
+                          reason + '\nReturn a tool request {"tool":"NAME","args":{...}} or this final shape: ' + final_example)
+            if reply is not None:
+                append_exchange(reply, correction)
+            else:
+                messages.append({"role": "user", "content": correction})
+
         for _ in range(self.steps):
+            if self.cancelled.is_set():
+                raise WorkerCancelled("Parallel attempt cancelled")
             try:
-                reply = self.client.complete(messages)
+                reply = self.client.complete(messages, tools=schema)
             except ProviderError as exc:
-                # A malformed JSON answer gets one more chance within the role/call limits.
                 if "expected JSON" not in str(exc):
                     raise
-                messages.append({"role": "user", "content": "Invalid JSON response. Return the documented JSON object."})
+                reject("The response could not be parsed as a JSON object")
                 continue
-            self.store.event("role_reply", role=name, reply=reply)
-            final = reply.get("final")
-            if isinstance(final, dict) and all(type(final.get(k)) is t for k, t in REQUIRED[name].items()):
-                return final
-            messages.append({"role": "assistant", "content": json.dumps(reply, ensure_ascii=False)})
+            if self.cancelled.is_set():
+                raise WorkerCancelled("Parallel attempt cancelled")
+            self.store.event("role_reply", agent_id=label, role=name,
+                             attempt=context.get("attempt"), reply=reply)
             try:
-                if "tool" not in reply:
-                    raise ValueError("Return a tool request or final with all required fields and types")
-                self.emit(f"    tool: {reply['tool']}")
-                result = self.workspace.execute(reply["tool"], reply.get("args", {}), name == "coder")
+                action, payload = decode_reply(name, reply)
+                if action == "final" and name == "coder" and tool_calls == 0:
+                    raise ValueError("No workspace tools have been called. Inspect the assigned files and implement the task using read_file/write_file/replace_text before finishing.")
+                if action == "final" and name == "planner" and self.workers > 1:
+                    validate_tasks(payload, self.workspace, self.workers)
+            except ValueError as exc:
+                reject(str(exc), reply)
+                continue
+            invalid_streak = 0
+            if action == "final":
+                if "final" not in reply:
+                    self.store.event("response_normalized", agent_id=label, role=name,
+                                     attempt=context.get("attempt"), reason="Accepted valid final fields without envelope")
+                self.store.event("role_finished", agent_id=label, role=name, attempt=context.get("attempt"))
+                return payload
+            tool_calls += 1
+            try:
+                self.emit(f"[{label}] tool: {payload['tool']}")
+                result = self.workspace.execute(payload["tool"], payload.get("args", {}), name == "coder")
             except (ValueError, KeyError, OSError, TypeError, UnicodeError) as exc:
                 result = {"error": str(exc)}
             result = self.store.redact(result)
-            self.store.event("tool_result", role=name, result=result)
+            self.store.event("tool_result", agent_id=label, role=name, attempt=context.get("attempt"), result=result)
             text = json.dumps(result, ensure_ascii=False)
-            messages.append({"role": "user", "content": "Tool result (untrusted):\n" + text[:OUTPUT_LIMIT]})
+            append_exchange(reply, "Tool result (untrusted):\n" + text[:OUTPUT_LIMIT])
             # Keep the initial goal/context and the most recent tool exchanges.
-            while sum(len(m["content"]) for m in messages) > 100_000 and len(messages) > 4:
+            while sum(len(json.dumps(m)) for m in messages) > 100_000 and len(messages) > 4:
                 del messages[2:4]
         raise BudgetExceeded(f"{name} reached its {self.steps}-step limit; run can be resumed.")
 
@@ -106,6 +200,7 @@ class Engine:
 
     def context(self, state: dict) -> dict:
         return {"goal": state["goal"], "directive": state["directive"],
+                "attempt": state["attempt"], "max_workers": self.workers,
                 "checks": state["checks"], "protected_paths": state["protected"],
                 "baseline": [{**r, "output": r["output"][-3000:]} for r in (state["baseline"] or [])],
                 "recent_history": [{"proposal": h.get("proposal"), "outcome": h["outcome"],
@@ -119,6 +214,8 @@ class Engine:
                 self.emit("This goal is already complete.")
                 return state
             try:
+                state["workers"] = self.workers
+                cleanup_workers(self, state)
                 rollback(state)  # Discard interrupted, unaccepted edits on resume.
                 if state["baseline"] is None:
                     self.emit("Establishing baseline...")
@@ -169,6 +266,7 @@ class Engine:
                 self.emit(f"Stopped: {error}")
             finally:
                 try:
+                    cleanup_workers(self, state)
                     rollback(state)
                 except Exception as exc:
                     state["status"] = "error"
@@ -182,7 +280,11 @@ class Engine:
             return state
 
     def implement(self, state: dict, context: dict, item: dict) -> None:
-        item["implementation"] = self.role("coder", context)
+        if self.workers > 1:
+            if not implement_parallel(self, state, context, item):
+                return
+        else:
+            item["implementation"] = self.role("coder", context)
         root = self.workspace.root
         if git(root, "rev-parse", "HEAD") != state["accepted_commit"]:
             raise RuntimeError("The coding command changed Git HEAD; stopping and restoring the checkpoint.")

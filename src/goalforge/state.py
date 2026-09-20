@@ -7,17 +7,18 @@ import os
 from pathlib import Path
 import subprocess
 import time
+from threading import Lock
 import uuid
 
 
-def git(root: Path, *args: str) -> str:
+def git(root: Path, *args: str, strip: bool = True) -> str:
     command = ["git", "-c", "core.hooksPath=" + os.devnull,
                "-c", "commit.gpgsign=false", "-c", "core.quotePath=false", "-C", str(root), *args]
     result = subprocess.run(command, text=True, encoding="utf-8", errors="replace",
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
     if result.returncode:
         raise RuntimeError(f"Git {args[0]} failed: {result.stderr.strip()[:1200]}")
-    return result.stdout.strip()
+    return result.stdout.strip() if strip else result.stdout
 
 
 def save(path: Path, value: dict) -> None:
@@ -27,7 +28,7 @@ def save(path: Path, value: dict) -> None:
 
 
 def fingerprint(proposal: dict) -> str:
-    text = " ".join((proposal["title"] + " " + proposal["approach"]).lower().split())
+    text = " ".join(json.dumps(proposal, sort_keys=True, ensure_ascii=False).lower().split())
     return hashlib.sha256(text.encode()).hexdigest()
 
 
@@ -35,6 +36,7 @@ class Store:
     def __init__(self, root: Path, secret: str = ""):
         self.root, self.secret = root, secret
         self.file = root / "state.json"
+        self._events_lock = Lock()
 
     def redact(self, value):
         text = json.dumps(value, ensure_ascii=False)
@@ -51,8 +53,9 @@ class Store:
 
     def event(self, kind: str, **values) -> None:
         record = self.redact({"time": time.time(), "kind": kind, **values})
-        with (self.root / "events.jsonl").open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with self._events_lock:
+            with (self.root / "events.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     @contextmanager
     def lock(self):

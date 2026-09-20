@@ -5,9 +5,9 @@ A small Python CLI coding agent inspired by **RecEvolve**. Give it a coding goal
 Use it for bug fixes, small features, refactoring, tests, and documentation. It is a working starter implementation, not a reproduction of the paper's production infrastructure or a claim of equivalent results.
 
 - Python 3.10+ and Git; **no third-party Python runtime dependencies**.
-- One process, with sequential planner, critic, coder, and reviewer LLM calls.
+- A planner and critic coordinate **up to 3 concurrent coding workers by default**, followed by integration and review.
 - Configurable Chat Completions-compatible endpoint and model.
-- Persistent run history, isolated Git worktree, bounded requests and attempts.
+- Persistent run history, separate worker worktrees, and one shared request budget.
 - File editing tools plus terminal commands; command approval by default.
 
 ## Install
@@ -34,28 +34,34 @@ If activation is unavailable, invoke `.venv\Scripts\python.exe -m goalforge` aft
 
 ## Configure your LLM
 
-Use your provider's **API base URL**, typically ending in `/v1`, and its exact model ID. The tool appends `/chat/completions`. An API key alone does not identify your provider or model.
+Edit the `.env` file in the GoalForge directory and set:
 
-macOS/Linux/WSL:
+```dotenv
+LLM_API_KEY=your-api-key
+LLM_MODEL=your-model-id
+LLM_BASE_URL=https://your-provider/v1
+```
+
+`LLM_MODEL` selects the model by its exact provider model ID. `LLM_BASE_URL` selects the provider's Chat Completions-compatible API base URL, usually ending in `/v1`. GoalForge appends `/chat/completions`; do not include that suffix yourself.
+
+For a fresh clone, create the local file with `cp .env.example .env` (macOS/Linux/WSL) or `Copy-Item .env.example .env` (PowerShell). `.env` and `.env.*` are ignored by Git, except the safe `.env.example` template. Never put a real key in the template.
+
+GoalForge automatically reads `.env` from the **directory where you launch the command**, including when `--repo` points to another project. It does not search parent directories or automatically read the target repository's configuration. From another directory, select it explicitly:
 
 ```bash
-export LLM_BASE_URL="https://YOUR-PROVIDER/v1"
-export LLM_MODEL="YOUR-MODEL-ID"
-# Optional: set LLM_API_KEY in your environment.
-# If omitted, GoalForge asks for it privately when you start a run.
+goalforge run "Fix empty input handling" --repo /path/to/project --env-file /path/to/goalforge/.env --check "python -m unittest discover -s tests"
+goalforge resume RUN_ID --env-file /path/to/goalforge/.env
 ```
 
-PowerShell:
+Configuration priority is **CLI flags → existing environment variables → `.env` → saved run settings (on resume)**. The same `--env-file` option works with `list`, `status`, and `history`. An explicitly requested missing file is an error; a missing default `.env` is fine. `GOALFORGE_HOME` can also be set in `.env` to choose where run state is saved.
 
-```powershell
-$env:LLM_BASE_URL = "https://YOUR-PROVIDER/v1"
-$env:LLM_MODEL = "YOUR-MODEL-ID"
-# Optional: set $env:LLM_API_KEY, or use the hidden prompt.
-```
+Values may be unquoted or enclosed in single/double quotes. Blank lines, `#` comment lines, inline comments after whitespace, and optional `export NAME=value` are supported. Values are literal: no shell execution, variable expansion, escape decoding, or multiline values. Quote a value if it contains whitespace followed by `#`.
 
-The key is not saved in run configuration. Prefer the hidden prompt over putting a real key into shell history. For automation, supply `LLM_API_KEY` through your environment or secret manager. `--key-env NAME` reads another variable instead. Noninteractive runs require that variable to be set.
+The key stays in your local `.env`; it is not saved in run configuration. Settings loaded from the file are not exported into subprocess environments. Alternatively, supply `LLM_API_KEY` through the environment or leave it blank for a hidden terminal prompt. `--key-env NAME` selects another key variable, from either source. Noninteractive runs require a configured key.
 
-The client sends `model`, `messages`, and `max_tokens`, and expects text containing JSON in `choices[0].message.content`. It does not require native function calling or JSON-schema support. Select a model that follows structured instructions. Native Anthropic Messages, Gemini, and other incompatible API shapes require a compatible gateway or an adapter in `provider.py`. Providers that require different token parameters also need an adapter. No automatic provider detection is attempted.
+For OpenAI, a low-cost starting configuration is `LLM_MODEL=gpt-5.4-mini` and `LLM_BASE_URL=https://api.openai.com/v1`.
+
+The client sends `model`, `messages`, and `max_completion_tokens` for `api.openai.com` (`max_tokens` for other compatible providers), and registers native function tools for OpenAI. Tool results are returned with matching call IDs, and each role finishes through a schema-checked `finish` function. Other compatible providers use the fallback text-JSON protocol in `choices[0].message.content`; choose a model that follows those instructions. Native Anthropic Messages, Gemini, and other incompatible API shapes require a compatible gateway or an adapter in `provider.py`. Providers that require different token parameters also need an adapter. No automatic provider detection is attempted.
 
 For a local compatible server, a base URL such as `http://localhost:8000/v1` is allowed; set a dummy key if the server does not authenticate. Remote endpoints require HTTPS. HTTP redirects are refused to avoid forwarding credentials.
 
@@ -97,7 +103,65 @@ The optional directive supplies your coding conventions and constraints. Goals a
 
 Checks and model commands are argument lists executed without an implicit shell. `&&`, pipes, glob expansion and shell builtins will not work automatically. Put complex verification in a script, or explicitly use a shell such as `bash -lc '...'`. Relative command paths resolve inside the worktree. For a virtual environment living in the original repository, use the interpreter's absolute path: untracked environments are not copied to worktrees.
 
-## Try the included example
+## Watch parallel agents work
+
+From the GoalForge directory, after configuring `.env`:
+
+```bash
+python3 examples/run_parallel_demo.py
+```
+
+On Windows, use `python examples/run_parallel_demo.py`. No package installation is needed for this script. It creates a fresh demo repository next to GoalForge, commits the starting files, and uses your configured LLM. Each invocation gets a new directory, so you can run the demo repeatedly.
+
+The goal has three independent modules: text slugification, numeric median, and leap-year calculation. Its 13 acceptance tests intentionally fail initially. The planner is asked to assign one module to each worker. A successful run looks roughly like this (tool calls and completion order vary):
+
+```text
+[planner] START planner
+[critic] START critic
+[orchestrator] Dispatching 3 coding worker(s); cap=3
+[coder-1] START Implement slugify | files: text_tools.py
+[coder-2] START Implement median | files: stats_tools.py
+[coder-3] START Implement leap-year check | files: date_tools.py
+[coder-2] tool: read_file
+[coder-1] tool: read_file
+[coder-3] tool: write_file
+[coder-3] DONE (1 changed files)
+[coder-1] DONE (1 changed files)
+[coder-2] DONE (1 changed files)
+[orchestrator] Integrating worker patches...
+  check: ...
+    PASS
+[reviewer] START reviewer
+  KEPT: ...
+Status: complete
+```
+
+Coder HTTP requests and tool loops run concurrently in Python worker threads. Each has a separate conversation and Git worktree. They use the same configured model and API key. This is real concurrent execution, not a sequential simulation; provider-side queuing can still limit speed.
+
+`--workers 3` sets a concurrency **ceiling**, not a requirement to create three tasks for every goal. The planner may select fewer useful tasks. For example, the tiny single-function bug below should usually use only one worker. The three-module demo makes parallel work natural. Use `--workers 1` to retain the original sequential coding mode, or increase the ceiling up to 8.
+
+```bash
+goalforge run "Implement independent features A and B" --repo /path/to/project --check "python -m unittest discover -s tests" --workers 2
+goalforge resume RUN_ID --workers 3
+```
+
+The planner defines exact file ownership and shared interface requirements. The critic reviews whether tasks can really proceed independently. Workers read the shared plan but implement only their assigned task. There is **no direct peer chat or shared mutable working tree**: communication is through the plan, structured results, patches, and the orchestrator. If one task needs another task's output, the planner should schedule it in a later iteration.
+
+Only disjoint file assignments are accepted. File tools enforce ownership; a worker patch touching an unassigned or protected file is rejected even if the change came from an approved command. These checks are workflow controls, not OS sandboxing.
+
+After all workers finish, their patches are applied to the integration worktree in a deterministic order. The complete change must pass all required checks and the reviewer. If a worker fails, integration fails, or combined verification fails, the **whole attempt** is reverted. Earlier accepted iterations stay intact. Individual worker results are not independently accepted or committed.
+
+LLM-suggested commands still ask for approval. Requests are queued and presented one at a time on the main thread; output labels identify the requesting worker. Add `--yes` only when you want unattended command execution. Ctrl-C cancels pending work; already-running HTTP requests or commands may need to finish or reach their timeout before cleanup completes.
+
+`history RUN_ID` includes each worker's task, changed paths, summary and patch reference for successfully collected results. `events.jsonl` records worker start/finish/failure, role calls, approvals and integration with timestamps, agent IDs and attempt numbers. For detailed live inspection, use `tail -f /path/to/run/events.jsonl` in a second terminal. There is no graphical dashboard yet.
+
+To create only the example repository without making API requests:
+
+```bash
+python3 examples/run_parallel_demo.py --prepare-only
+```
+
+## Try the small sequential example
 
 `examples/tiny_project` has a deliberately failing test for an empty average. This example is separate from GoalForge's own passing tests.
 
@@ -129,20 +193,20 @@ In PowerShell, replace the copy command with `Copy-Item examples/tiny_project ..
 | Ideator and critic | Separate proposal and feasibility calls |
 | Coding agent | Local file and command tools |
 | Centralized knowledge | Durable attempt history injected into later roles |
-| Isolated experiments | One Git worktree per goal |
+| Isolated experiments | An integration worktree plus temporary worktrees for parallel coders |
 | Evaluation and rollback | Required checks plus review, then commit or revert |
 
-This adaptation replaces recommender-model training with ordinary software verification and stops at a finite goal. It uses sequential roles sharing one model, without distributed training, parallel experiments, literature search, or production deployment.
+This adaptation replaces recommender-model training with ordinary software verification and stops at a finite goal. It uses a bounded pool of concurrent coding workers sharing one model, with sequential planning and final review. It does not include distributed training, literature search, or production deployment.
 
 ### Execution details
 
 1. **Create a run.** Record the original commit, goal, directive, commands and protected paths. Create branch `goalforge/<run-id>` and its own worktree outside the repository.
 2. **Measure the baseline.** Execute your checks and retain their results. Restore the committed source after the baseline so check-generated source edits do not become the starting point.
-3. **Plan.** Give a fresh planner the goal, file index, baseline, and recent lessons. It can read files and search text before proposing one coherent increment.
-4. **Critique.** A separate read-only role reviews the plan. A rejection becomes a lesson. An exact normalized title/approach already tried on the same accepted commit is skipped.
-5. **Implement.** The coder reads and edits files and may request commands. File changes happen automatically in the dedicated worktree; model commands ask for approval unless `--yes` is set.
-6. **Verify and review.** Execute your fixed checks. Stage the diff, reject changes to protected/private paths, and ask a fresh reviewer to assess the implementation and evidence. Diffs over 60,000 characters are rejected so the agent must split large changes.
-7. **Keep or revert.** Only passing checks plus reviewer acceptance can keep a change. An accepted partial increment is committed and becomes the next starting point. A rejected attempt restores the last accepted commit and deletes untracked, nonignored files in the agent worktree.
+3. **Plan.** Give a fresh planner the goal, file index, baseline, and recent lessons. In parallel mode it proposes independent tasks with exact, nonoverlapping file assignments. In sequential mode it proposes one coherent increment.
+4. **Critique.** A separate read-only role reviews the plan. A rejection becomes a lesson. An exact normalized proposal already tried on the same accepted commit is skipped.
+5. **Implement.** Concurrent coders read and edit their assigned files in separate worktrees created from the last accepted commit. Each receives the common plan and its own task. File edits happen automatically; model commands ask for approval unless `--yes` is set. With `--workers 1`, a single coder edits the integration worktree directly.
+6. **Integrate, verify and review.** Wait for every worker, validate ownership, and apply all worker patches to the integration worktree. Execute your fixed checks. Stage the diff, reject changes to protected/private paths, and ask a fresh reviewer to assess the implementation and evidence. Diffs over 60,000 characters are rejected so the agent must split large changes.
+7. **Keep or revert.** Only passing checks plus reviewer acceptance can keep a change. An accepted batch or partial increment is committed and becomes the next starting point. A rejected attempt restores the last accepted commit and deletes untracked, nonignored files in the agent worktree.
 8. **Record and continue.** Save the outcome and lesson. Stop when the reviewer marks the full goal complete, the attempt/request limit is reached, an error occurs, or you interrupt execution.
 
 “Complete” means the configured checks passed and the LLM reviewer judged the goal satisfied. It is not a formal correctness guarantee. Choose checks that exercise the behavior you actually want. A reviewer can miss bugs or accept superficial changes; review the resulting branch before integrating it.
@@ -160,7 +224,7 @@ goalforge resume RUN_ID --iterations 5 --max-calls 80
 
 Resume preserves the goal, checks, accepted commits, and history. It reruns an interrupted attempt from the last accepted commit; it does not resume an individual tool conversation. **Unaccepted manual edits in the agent worktree are discarded on resume.** Make your own edits on another branch or commit/integrate them separately. Do not run two sessions against the same run; an OS lock prevents concurrent execution.
 
-Provider/model configuration is saved for resume; keys are never saved. `--model` and `--base-url` (or environment variables) can override the saved values for an invocation. Each resume gets a new request/iteration budget. Lifetime usage counters are shown separately. Reported token usage depends on the provider supplying usage fields; there is no dollar-cost cap.
+The worker limit is saved for resume; old runs without a worker setting keep sequential mode unless you pass `--workers`. Provider/model configuration is saved for resume; keys are never saved in run state. `--model` and `--base-url` (or environment / `.env` settings) can override the saved values for an invocation. Each resume gets a new request/iteration budget. Lifetime usage counters are shown separately. Reported token usage depends on the provider supplying usage fields; there is no dollar-cost cap.
 
 From the original repository, inspect and integrate the branch printed by the CLI:
 
@@ -170,6 +234,8 @@ git log --oneline ORIGINAL_COMMIT..goalforge/RUN_ID
 git merge --ff-only goalforge/RUN_ID
 ```
 
+Worker worktrees are removed on success, failure or cancellation. Resume also cleans up recorded worker worktrees left by a process crash before restarting from the last accepted commit.
+
 If your original branch has advanced, fast-forward merging may fail. Review and merge or cherry-pick using your normal Git workflow. GoalForge never automatically merges, pushes or deploys.
 
 Exit codes: `0` for complete or successful inspection, `2` for an incomplete/budget-limited or paused run, and `1` for errors. An interrupt before the engine starts returns `130`.
@@ -178,8 +244,9 @@ Exit codes: `0` for complete or successful inspection, `2` for an incomplete/bud
 
 | Option | Default | Meaning |
 | --- | --- | --- |
+| `--workers` | 3 for new CLI runs | Concurrent coding workers (1–8); planner may use fewer |
 | `--iterations` | 5 | Attempts during this invocation |
-| `--max-calls` | 80 | HTTP requests, including retries |
+| `--max-calls` | 80 | Shared across all roles and workers, including retries |
 | `--role-steps` | 12 | Responses/tool steps per role |
 | `--max-tokens` | 4096 | Requested output-token limit per response |
 | `--timeout` | 120 | Seconds per local command |
@@ -187,7 +254,7 @@ Exit codes: `0` for complete or successful inspection, `2` for an incomplete/bud
 | `--yes` | off | Authorize model commands without prompts |
 | `--runs-dir` | `~/.goalforge/runs` | State/worktree location outside the target repo |
 
-`GOALFORGE_HOME` changes the parent directory of `runs`. Use the same `--runs-dir` on subsequent inspection/resume commands if you customize it. There is no automatic background scheduler.
+`GOALFORGE_HOME` changes the parent directory of `runs`. Use the same `--runs-dir` on subsequent inspection/resume commands if you customize it. There is no automatic background scheduler. More workers may spend the shared request budget faster; the limit is not multiplied per worker.
 
 Each run contains:
 
@@ -196,7 +263,11 @@ RUN_ID/
   state.json       # goal, configuration, checkpoints, history, usage
   events.jsonl     # role replies, tool results, checks and decisions
   run.lock         # OS-lock handle; harmless when no process holds it
-  workspace/       # Git worktree on the goal branch
+  workspace/       # Integration worktree on the goal branch
+  workers/
+    attempt-1/
+      coder-1.patch  # Worker patch retained for inspection
+      coder-2.patch  # Temporary worker worktrees are removed after the attempt
 ```
 
 The key is redacted from recorded tool results. Logs still contain source code and command output, so treat them as private project data. Removing a run's storage prevents resume. After integrating its changes, remove its worktree with `git worktree remove PATH` before deleting the run directory; Git should manage worktree registration.
@@ -216,26 +287,39 @@ Other deliberate constraints:
 - Completion quality depends on the model, task size, context, and checks. Large goals usually need multiple accepted increments or narrower goals.
 - The API adapter targets a common protocol, not every provider's extensions. Retries for rate limiting/transient server failures consume the request budget.
 
+## Response format troubleshooting
+
+OpenAI agents use native file/command functions and a structured `finish` function. Other providers are instructed to return either a JSON tool request or `{"final": {...}}` with their role's result. GoalForge also accepts unwrapped final fields when they satisfy the same schema. Missing fields, string values in place of booleans, ambiguous tool/final combinations, and invalid file ownership remain errors.
+
+A coding role cannot finish before calling a workspace tool. A summary claiming that no tools are available triggers corrective feedback rather than silently counting as completed coding.
+
+Format rejections are printed in the terminal and saved as `response_rejected` events with a concrete reason. Three consecutive invalid responses stop that role early to avoid spending the entire step budget on the same formatting problem. Accepted unwrapped results are logged as `response_normalized`. You can resume a stopped run after fixing its cause; increasing the request budget alone will not fix a repeated format error.
+
 ## Development and tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-Tests use temporary Git repositories and a local mock HTTP server, so no key or paid request is needed. They exercise the CLI-to-HTTP workflow, rollback, resume, check gating, request budgets, memory, locking, file boundaries, timeout handling and credential handling. Live provider behavior and real-model coding quality require separate testing with your endpoint.
+Tests use temporary Git repositories and a local mock HTTP server, so no key or paid request is needed. They exercise the CLI-to-HTTP workflow, barrier-proven concurrent workers, atomic integration/rollback, crash recovery, cancellation during approval, shared request budgets, ownership checks, memory, locking, file boundaries, timeout handling and credential handling. Live provider behavior and real-model coding quality require separate testing with your endpoint.
 
 ```text
 src/goalforge/
   cli.py          # commands, settings and terminal output
-  provider.py     # HTTP adapter, response parsing, request budgets
+  config.py       # literal .env loading and environment precedence
+  provider.py     # HTTP adapter, native/text response parsing, request budgets
+  tool_schemas.py # role-specific native function schemas
   engine.py       # role prompts and orchestration
+  swarm.py        # concurrent coders, ownership validation and patch integration
   workspace.py    # file tools and subprocess execution
   state.py        # durable state, locking and Git checkpoints
 examples/
   directive.md
-  tiny_project/   # intentionally failing target for a first goal
+  tiny_project/   # single-function bug
+  parallel_project/ # three independent modules and protected acceptance tests
+  run_parallel_demo.py # one-command live parallel demo
 ```
 
-To extend it, add a provider adapter implementing `complete(messages) -> dict` and a `budget` object, add tools in `Workspace.execute`, or customize the role prompts and acceptance policy in `engine.py`.
+To extend it, add a provider adapter implementing `complete(messages, tools=...) -> dict`, `fork()` for a worker client, and a shared thread-safe `budget` object, add tools in `Workspace.execute`, or customize the role prompts and acceptance policy in `engine.py`.
 
 MIT licensed. The paper is credited as architectural inspiration; no paper code or production artifacts are bundled.

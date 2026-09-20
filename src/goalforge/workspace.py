@@ -63,10 +63,12 @@ def run_process(argv: list[str], cwd: Path, timeout: float, secret: str = "") ->
 
 class Workspace:
     def __init__(self, root: Path, approve: Callable[[list[str]], bool],
-                 timeout: float = 120, protected: list[str] | None = None, secret: str = ""):
+                 timeout: float = 120, protected: list[str] | None = None, secret: str = "",
+                 allowed_paths: set[str] | None = None):
         self.root = root.resolve()
         self.approve, self.timeout, self.secret = approve, timeout, secret
         self.protected = protected or []
+        self.allowed_paths = allowed_paths
 
     def path(self, value: str, writing: bool = False) -> Path:
         if not isinstance(value, str) or not value or Path(value).is_absolute():
@@ -83,6 +85,8 @@ class Workspace:
                 raise ValueError("Symlink access is not allowed")
         if writing and self.is_protected(target.relative_to(self.root).as_posix()):
             raise ValueError("This path is protected by the user")
+        if writing and self.allowed_paths is not None and target.relative_to(self.root).as_posix() not in self.allowed_paths:
+            raise ValueError("This file belongs to another task; edit only your assigned files")
         return target
 
     def is_protected(self, relative: str) -> bool:

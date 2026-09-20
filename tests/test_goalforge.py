@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -52,7 +53,7 @@ class ScriptedClient:
         self.replies = iter(replies)
         self.budget = Budget(limit)
 
-    def complete(self, messages):
+    def complete(self, messages, **kwargs):
         if self.budget.used >= self.budget.limit:
             raise BudgetExceeded("Test budget exhausted")
         self.budget.used += 1
@@ -125,9 +126,21 @@ class ProviderTests(unittest.TestCase):
             client = Client(url, "test-model", "test-key", Budget(3))
             self.assertEqual(client.complete([{"role": "user", "content": "hi"}]), proposal())
             self.assertEqual(seen[0]["path"], "/v1/chat/completions")
+            self.assertEqual(seen[0]["body"]["max_tokens"], 4096)
             self.assertEqual(seen[0]["authorization"], "Bearer test-key")
             self.assertEqual(client.budget.input_tokens, 10)
             self.assertEqual(client.budget.used, 1)
+
+    def test_openai_uses_completion_token_parameter(self):
+        client = Client("https://api.openai.com/v1", "gpt-5.4-mini", "fake-key", Budget(1))
+        response = {"choices": [{"message": {"content": json.dumps(proposal())}}]}
+        with patch.object(client.opener, "open", return_value=io.BytesIO(json.dumps(response).encode())) as mocked:
+            client.complete([{"role": "user", "content": "Return JSON"}])
+        request = mocked.call_args.args[0]
+        body = json.loads(request.data)
+        self.assertEqual(request.full_url, "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(body["max_completion_tokens"], 4096)
+        self.assertNotIn("max_tokens", body)
 
     def test_retry_obeys_budget(self):
         with server([], status=429) as (url, seen), patch("goalforge.provider.time.sleep"):
@@ -243,12 +256,27 @@ class EngineTests(unittest.TestCase):
         event = json.loads((self.store.root / "events.jsonl").read_text().splitlines()[-1])
         self.assertEqual(event["value"], "a [REDACTED] b")
 
+    def test_cli_end_to_end_with_dotenv(self):
+        with server(replies()) as (url, seen):
+            env_file = self.root / '.env'
+            env_file.write_text(f'LLM_API_KEY=dotenv-key\nLLM_MODEL=dotenv-model\nLLM_BASE_URL={url}\n')
+            with patch.dict(os.environ, {'PATH': os.environ.get('PATH', '')}, clear=True):
+                result = main(["run", "Make value two", "--repo", str(self.repo),
+                               "--runs-dir", str(self.root / "dotenv-runs"), "--check",
+                               f'"{sys.executable}" verify.py', "--protect", "verify.py",
+                               "--env-file", str(env_file), "--iterations", "1", "--workers", "1"])
+            self.assertEqual(result, 0)
+            self.assertEqual(seen[0]["authorization"], "Bearer dotenv-key")
+            self.assertEqual(seen[0]["body"]["model"], "dotenv-model")
+            for path in (self.root / "dotenv-runs").glob("*/*.json*"):
+                self.assertNotIn("dotenv-key", path.read_text())
+
     def test_cli_end_to_end_with_real_http(self):
         with server(replies()) as (url, seen), patch.dict(os.environ, {"LLM_API_KEY": "fake-key"}):
             result = main(["run", "Make value two", "--repo", str(self.repo),
                            "--runs-dir", str(self.root / "cli-runs"), "--check",
                            f'"{sys.executable}" verify.py', "--protect", "verify.py",
-                           "--base-url", url, "--model", "test", "--iterations", "1"])
+                           "--base-url", url, "--model", "test", "--iterations", "1", "--workers", "1"])
         self.assertEqual(result, 0)
         self.assertEqual(len(seen), 5)
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.initial)

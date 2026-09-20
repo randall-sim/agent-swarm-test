@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
-import os
 from pathlib import Path
 import shlex
 import sys
+from threading import RLock
 
+from .config import settings
 from .engine import Engine
 from .provider import Budget, Client
 from .state import Store, create_run
@@ -21,8 +22,11 @@ def positive(value: str) -> int:
     return number
 
 
-def default_runs() -> Path:
-    return Path(os.environ.get("GOALFORGE_HOME", str(Path.home() / ".goalforge"))) / "runs"
+def worker_count(value: str) -> int:
+    number = positive(value)
+    if number > 8:
+        raise argparse.ArgumentTypeError("must be between 1 and 8")
+    return number
 
 
 def parser() -> argparse.ArgumentParser:
@@ -37,10 +41,11 @@ def parser() -> argparse.ArgumentParser:
     for command in (run, sub.add_parser("resume", help="Continue from the last accepted checkpoint")):
         if command is not run:
             command.add_argument("run_id")
-        command.add_argument("--runs-dir", type=Path, default=default_runs())
-        command.add_argument("--model", default=os.environ.get("LLM_MODEL"), help="Your provider's model ID (or LLM_MODEL)")
-        command.add_argument("--base-url", default=os.environ.get("LLM_BASE_URL"), help="Chat Completions API base URL, usually ending /v1")
+        command.add_argument("--runs-dir", type=Path, default=None)
+        command.add_argument("--model", default=None, help="Your provider's model ID (or LLM_MODEL)")
+        command.add_argument("--base-url", default=None, help="Chat Completions API base URL, usually ending /v1")
         command.add_argument("--key-env", default="LLM_API_KEY", help="Environment variable containing the key; otherwise prompt privately")
+        command.add_argument("--workers", type=worker_count, help="Concurrent coding workers, 1–8 (new runs default to 3; 1 uses sequential mode)")
         command.add_argument("--iterations", type=positive, default=5, help="Maximum attempts this invocation (default 5)")
         command.add_argument("--max-calls", type=positive, default=80, help="Maximum HTTP requests, including retries (default 80)")
         command.add_argument("--role-steps", type=positive, default=12, help="Maximum requests per role (default 12)")
@@ -51,9 +56,12 @@ def parser() -> argparse.ArgumentParser:
     for name in ("status", "history"):
         command = sub.add_parser(name, help="Inspect saved " + name)
         command.add_argument("run_id")
-        command.add_argument("--runs-dir", type=Path, default=default_runs())
+        command.add_argument("--runs-dir", type=Path, default=None)
     ls = sub.add_parser("list", help="List saved runs")
-    ls.add_argument("--runs-dir", type=Path, default=default_runs())
+    ls.add_argument("--runs-dir", type=Path, default=None)
+    for command in sub.choices.values():
+        command.add_argument("--env-file", type=Path,
+                             help="Configuration file (default: .env in the current directory)")
     return p
 
 
@@ -69,6 +77,7 @@ def resolve_store(args) -> Store:
 
 def report(state: dict) -> None:
     print(f"\nRun: {state['id']}\nStatus: {state['status']}\nGoal: {state['goal']}")
+    print(f"Coding worker limit: {state.get('workers', 1)}")
     print(f"Branch: {state['branch']}\nWorkspace: {state['workspace']}")
     print(f"Accepted commit: {state['accepted_commit']}\nUsage: {json.dumps(state['usage'])}")
     if state.get("last_error") and state["status"] in {"error", "paused", "budget_exhausted"}:
@@ -82,6 +91,9 @@ def report(state: dict) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        config = settings(args.env_file)
+        if args.runs_dir is None:
+            args.runs_dir = Path(config.get("GOALFORGE_HOME") or str(Path.home() / ".goalforge")) / "runs"
         if args.command == "list":
             for path in sorted(args.runs_dir.glob("*/state.json")):
                 state = json.loads(path.read_text(encoding="utf-8"))
@@ -96,14 +108,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         store = resolve_store(args) if args.command == "resume" else None
         prior = store.read() if store else {}
-        model = args.model or prior.get("model")
-        base_url = args.base_url or prior.get("base_url")
+        workers = args.workers if args.workers is not None else prior.get("workers", 1 if prior else 3)
+        model = args.model or config.get("LLM_MODEL") or prior.get("model")
+        base_url = args.base_url or config.get("LLM_BASE_URL") or prior.get("base_url")
         if not model or not base_url:
-            raise ValueError("Set --model and --base-url (or LLM_MODEL and LLM_BASE_URL).")
-        key = os.environ.get(args.key_env)
+            raise ValueError("Set --model and --base-url (or LLM_MODEL and LLM_BASE_URL in .env).")
+        key = config.get(args.key_env)
         if not key:
             if not sys.stdin.isatty():
-                raise ValueError(f"Set {args.key_env}; a noninteractive session cannot prompt for a key.")
+                raise ValueError(f"Set {args.key_env} in .env or the environment; a noninteractive session cannot prompt for a key.")
             key = getpass.getpass("LLM API key (hidden, not saved): ")
         if not key:
             raise ValueError("An API key is required; use a dummy value for a local server without authentication.")
@@ -123,19 +136,27 @@ def main(argv: list[str] | None = None) -> int:
         store.secret = key
         state = store.read()
 
+        terminal_lock = RLock()
+
+        def emit(message: str) -> None:
+            with terminal_lock:
+                print(message, flush=True)
+
         def approve(command: list[str]) -> bool:
             if args.yes:
                 return True
             if not sys.stdin.isatty():
                 print("Denied model command in noninteractive mode; use --yes to allow commands.")
                 return False
-            return input("Run in worktree " + json.dumps(command) + "? [y/N] ").strip().lower() in {"y", "yes"}
+            with terminal_lock:
+                return input("Run in worktree " + json.dumps(command) + "? [y/N] ").strip().lower() in {"y", "yes"}
 
         print(f"Run ID: {state['id']}\nWorking in: {state['workspace']}")
         print("Your configured checks run automatically. Model commands " +
               ("are authorized by --yes." if args.yes else "require approval."))
         workspace = Workspace(Path(state["workspace"]), approve, args.timeout, state["protected"], key)
-        result = Engine(store, client, workspace, args.role_steps).execute(args.iterations)
+        emit(f"Coding worker limit: {workers} (one shared request budget)")
+        result = Engine(store, client, workspace, args.role_steps, emit, workers=workers).execute(args.iterations)
         report(result)
         return 0 if result["status"] == "complete" else (1 if result["status"] == "error" else 2)
     except (OSError, ValueError, RuntimeError) as exc:

@@ -6,7 +6,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any
 
 
@@ -24,6 +25,20 @@ class Budget:
     used: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    _lock: Lock = field(default_factory=Lock, repr=False, compare=False)
+
+    def reserve(self) -> None:
+        with self._lock:
+            if self.used >= self.limit:
+                raise BudgetExceeded(f"LLM request budget ({self.limit}) exhausted.")
+            self.used += 1
+
+    def record(self, usage: dict) -> None:
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        completion = int(usage.get("completion_tokens", 0) or 0)
+        with self._lock:
+            self.input_tokens += prompt
+            self.output_tokens += completion
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -42,18 +57,25 @@ class Client:
             raise ValueError("Base URL must not contain credentials, a query, or a fragment.")
         if url.scheme == "http" and url.hostname not in {"localhost", "127.0.0.1", "::1"}:
             raise ValueError("Use HTTPS for non-local LLM endpoints.")
+        self.native_tools = url.hostname == "api.openai.com"
+        self.token_parameter = "max_completion_tokens" if url.hostname == "api.openai.com" else "max_tokens"
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model, self.api_key, self.budget = model, api_key, budget
         self.timeout, self.max_tokens = timeout, max_tokens
         self.opener = urllib.request.build_opener(NoRedirect())
 
-    def complete(self, messages: list[dict[str, str]]) -> dict[str, Any]:
-        payload = json.dumps({"model": self.model, "messages": messages,
-                              "max_tokens": self.max_tokens}).encode()
+    def fork(self) -> "Client":
+        """Independent HTTP transport and conversations, one shared request budget."""
+        return Client(self.url.removesuffix("/chat/completions"), self.model, self.api_key,
+                      self.budget, self.timeout, self.max_tokens)
+
+    def complete(self, messages: list[dict[str, Any]], *, tools: list[dict] | None = None) -> dict[str, Any]:
+        body = {"model": self.model, "messages": messages, self.token_parameter: self.max_tokens}
+        if self.native_tools and tools:
+            body.update(tools=tools, tool_choice="required", parallel_tool_calls=False)
+        payload = json.dumps(body).encode()
         for retry in range(3):
-            if self.budget.used >= self.budget.limit:
-                raise BudgetExceeded(f"LLM request budget ({self.budget.limit}) exhausted.")
-            self.budget.used += 1  # Retries consume the same hard budget.
+            self.budget.reserve()  # Atomic across workers; retries count too.
             request = urllib.request.Request(self.url, data=payload, headers={
                 "Authorization": "Bearer " + self.api_key,
                 "Content-Type": "application/json",
@@ -62,9 +84,24 @@ class Client:
                 with self.opener.open(request, timeout=self.timeout) as response:
                     data = json.loads(response.read(2_000_000))
                 usage = data.get("usage", {})
-                self.budget.input_tokens += int(usage.get("prompt_tokens", 0) or 0)
-                self.budget.output_tokens += int(usage.get("completion_tokens", 0) or 0)
-                content = data["choices"][0]["message"]["content"]
+                self.budget.record(usage)
+                message = data["choices"][0]["message"]
+                calls = message.get("tool_calls")
+                if self.native_tools and tools and calls:
+                    if len(calls) != 1:
+                        raise ValueError("Expected one tool call")
+                    call = calls[0]
+                    name = call["function"]["name"]
+                    if name not in {tool["function"]["name"] for tool in tools}:
+                        raise ValueError("Unknown function")
+                    arguments = json.loads(call["function"]["arguments"])
+                    if not isinstance(arguments, dict) or not isinstance(call.get("id"), str):
+                        raise ValueError("Invalid tool arguments or call ID")
+                    result = {"final": arguments} if name == "finish" else {"tool": name, "args": arguments}
+                    result["_native_message"] = {"role": "assistant", "content": message.get("content"), "tool_calls": calls}
+                    result["_native_call_id"] = call["id"]
+                    return result
+                content = message["content"]
                 if not isinstance(content, str):
                     raise ValueError("Expected text content")
                 content = content.strip()
@@ -73,6 +110,8 @@ class Client:
                 result = json.loads(content)
                 if not isinstance(result, dict):
                     raise ValueError("Expected a JSON object")
+                result.pop("_native_message", None)
+                result.pop("_native_call_id", None)
                 return result
             except urllib.error.HTTPError as exc:
                 if exc.code in {429, 500, 502, 503, 504} and retry < 2:

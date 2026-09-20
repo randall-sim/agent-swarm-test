@@ -1,0 +1,31 @@
+{
+  "title": "Plan three independent utility implementations",
+  "approach": "Inspect the three target modules and implement each utility in its own isolated change: text_tools.py for slugify, stats_tools.py for median, and date_tools.py for is_leap_year. Keep behavior aligned with the tests and existing style: slugify should normalize to lowercase ASCII letters/digits, collapse any non-alphanumeric run into a single hyphen, and trim hyphens from the ends; median should handle odd/even numeric inputs without mutating the caller\u2019s sequence and raise ValueError on empty input; is_leap_year should use the Gregorian leap-year rule. Because the work is independent, split it into three parallel tasks with disjoint file ownership and no shared edits.",
+  "acceptance": "All three modules have concrete implementations, the existing tests remain unchanged, and the full unittest discovery run passes without errors. Each function should satisfy its module\u2019s current tests, including empty-input handling for median and edge-case formatting for slugify.",
+  "tasks": [
+    {
+      "title": "Implement slugify in text_tools.py",
+      "approach": "Replace the placeholder in text_tools.py with a focused implementation that lowercases input, keeps ASCII letters/digits, converts any contiguous run of other characters into one hyphen, and strips leading/trailing hyphens from the final result.",
+      "acceptance": "tests/test_text_tools.py passes, including the word, punctuation, empty-string, and repeated-separator cases.",
+      "files": [
+        "text_tools.py"
+      ]
+    },
+    {
+      "title": "Implement median in stats_tools.py",
+      "approach": "Replace the placeholder in stats_tools.py with a median implementation that works for odd and even numeric sequences, returns the middle value(s) as appropriate, does not mutate the input sequence, and raises ValueError when given an empty sequence.",
+      "acceptance": "tests/test_stats_tools.py passes for singleton, odd-length, even-length, and empty-input behavior, and the caller\u2019s original data remains unchanged after calling median.",
+      "files": [
+        "stats_tools.py"
+      ]
+    },
+    {
+      "title": "Implement is_leap_year in date_tools.py",
+      "approach": "Replace the placeholder in date_tools.py with the Gregorian leap-year rule: divisible by 4 is leap except centuries, unless divisible by 400. Keep the implementation minimal and pure.",
+      "acceptance": "tests/test_date_tools.py passes for representative leap and common years, including century and 400-year edge cases.",
+      "files": [
+        "date_tools.py"
+      ]
+    }
+  ]
+}

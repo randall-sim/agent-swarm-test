@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# GoalForge local provider configuration
+.env.*
+!.env.example
