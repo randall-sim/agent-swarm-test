@@ -31,6 +31,11 @@
         <span id="status" class="badge">Ready</span>
       </header>
       <div id="error" role="alert" hidden></div>
+      <p id="server-update" class="attempt-outcome" role="status" hidden>
+        Server update required: restart GoalForge in your terminal to enable
+        agent context recording and the corrected planning loop. Refreshing the
+        page alone does not reload the Python engine.
+      </p>
       <section id="composer">
         <p class="muted">
           Give your agents a goal. Watch the plan become tested code.
@@ -56,11 +61,13 @@
           </label>
           <label
             >Verification commands
-            <small>One command per line; these run automatically.</small
+            <small
+              >Optional. One command per line; runs automatically. Leave blank
+              to run unittest discovery in tests/ using the server’s
+              Python.</small
             ><textarea
               id="checks"
               rows="2"
-              required
               placeholder="python -m unittest discover -s tests -v"
             ></textarea>
           </label>
@@ -123,6 +130,11 @@
           ><button id="integrate">Apply to original folder</button>
         </div>
         <div id="approvals"></div>
+        <div
+          id="attempt-navigation"
+          class="attempt-navigation"
+          aria-label="Attempt navigation"
+        ></div>
         <div id="agents" class="agents"></div>
         <div class="timeline-heading">
           <h2>Activity</h2>
@@ -174,7 +186,14 @@
     <aside class="inspector">
       <div class="inspector-heading">
         <h2 id="detail-title">Inside the swarm</h2>
-        <span>↗</span>
+        <button
+          id="expand-inspector"
+          type="button"
+          aria-expanded="false"
+          aria-controls="detail"
+        >
+          Expand panel ↗
+        </button>
       </div>
       <div id="detail">
         <div class="empty">

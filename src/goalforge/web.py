@@ -5,11 +5,11 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import secrets
-import shlex
 import threading
 from urllib.parse import parse_qs, urlsplit
 import webbrowser
 
+from .verification import verification_commands
 from .engine import Engine
 from .provider import Budget, Client
 from .state import Store, create_run, git
@@ -116,9 +116,7 @@ class WebApp:
                 goal = str(data.get('goal', '')).strip()
                 if not goal or len(goal) > 16000:
                     raise ValueError('Enter a goal under 16,000 characters')
-                checks = [shlex.split(line) for line in str(data.get('checks', '')).splitlines() if line.strip()]
-                if not checks or any(not c for c in checks):
-                    raise ValueError('Enter at least one verification command (one per line).')
+                checks = verification_commands(str(data.get('checks') or '').splitlines())
                 protected = [s.strip() for s in str(data.get('protected', '')).splitlines() if s.strip()]
                 if any(Path(p).is_absolute() or '..' in Path(p).parts for p in protected):
                     raise ValueError('Protected paths must be repository-relative')
@@ -253,7 +251,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond((Path(__file__).parent / 'web_assets' / name).read_text(), content_type=types[url.path])
             if url.path == '/api/config':
                 return self.respond(dict(repo=str(app.repo), model=app.config.get('LLM_MODEL', ''),
-                                         key_configured=bool(app.config.get('LLM_API_KEY'))))
+                                         key_configured=bool(app.config.get('LLM_API_KEY')),
+                                         context_capture_version=1))
             if url.path == '/api/runs':
                 runs = []
                 for p in sorted(app.runs.glob('*/state.json'), reverse=True):
@@ -325,7 +324,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond({'error': str(exc)}, 400)
 
 
-def serve(repo, runs, config, port=8765, open_browser=True):
+def serve(repo, runs, config, port=8765, open_browser=False):
     app = WebApp(repo, runs, config)
     server = Server(('127.0.0.1', port), app)
     url = f'http://127.0.0.1:{server.server_port}/#token={app.token}'

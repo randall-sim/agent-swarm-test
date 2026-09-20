@@ -21,7 +21,14 @@ max_workers entries. Each task has title, approach, acceptance (nonempty strings
 files (a nonempty list of exact repository-relative file paths, including new files).
 Split independent work across multiple tasks when useful; do not duplicate the same work.
 Each file may belong to exactly one task. All workers start at the same commit and cannot
-see each other's unmerged changes. Define any shared interfaces in the overall approach.
+see each other's unmerged changes. Define shared interfaces EXACTLY in the overall approach
+BEFORE dispatch: import module and symbol names (including exceptions), method names and argument
+order, return types with field names, and error/status semantics. For example, specify
+`storage.Store.reserve(sku, quantity, request_id) -> (reservation_dict, created_bool)` and name
+all exception classes and their defining module; "choose a shared exception vocabulary" is NOT
+a contract. Every affected task must reference the same decisions. A contract file written by
+one parallel worker is not visible to others until integration, so the proposal must contain
+all decisions they need. If this cannot be decided now, use a single worker for coupled changes.
 Do not assign tasks that depend on another worker finishing first: do that work in a later
 iteration instead. Use one task for tightly coupled work. Never invent work just to fill slots.
 Include test files in the owning task when new tests are needed. Do not assign protected paths.

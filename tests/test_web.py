@@ -76,6 +76,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.request('/', headers={'Host': 'evil.example'})[0], 403)
         status, config = self.request('/api/config')
         self.assertTrue(config['key_configured'])
+        self.assertEqual(config['context_capture_version'], 1)
         self.assertNotIn('secret-test-key', json.dumps(config))
 
     def test_parallel_run_trace_files_diff_and_explicit_integration(self):

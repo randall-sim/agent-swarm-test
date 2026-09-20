@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import json
+import math
+import random
+import re
+from email.utils import parsedate_to_datetime
 import time
 import urllib.error
 import urllib.parse
@@ -41,6 +45,67 @@ class Budget:
             self.output_tokens += completion
 
 
+class RateLimitExceeded(ProviderError):
+    """Temporary provider throttling exhausted the bounded retry window."""
+
+
+def retry_delay(headers, retry):
+    """Honor explicit server timing; otherwise use reset hints or jittered backoff."""
+    for key, scale in (("retry-after-ms", .001), ("retry-after", 1)):
+        value = headers.get(key)
+        if value is None:
+            continue
+        try:
+            seconds = float(value) * scale
+        except (ValueError, TypeError):
+            try:
+                seconds = parsedate_to_datetime(value).timestamp() - time.time()
+            except (ValueError, TypeError, OverflowError):
+                continue
+        if math.isfinite(seconds):
+            return max(0, seconds)
+    resets = []
+    for resource in ("requests", "tokens", "project-tokens"):
+        if headers.get("x-ratelimit-remaining-" + resource) != "0":
+            continue
+        value = headers.get("x-ratelimit-reset-" + resource, "")
+        parts = re.findall(r"(\d+(?:\.\d+)?)(ms|s|m|h)", value)
+        if parts and "".join(n + unit for n, unit in parts) == value:
+            resets.append(sum(float(n) * {"ms": .001, "s": 1, "m": 60, "h": 3600}[unit] for n, unit in parts))
+    return max(resets) if resets else min(60, 5 * 2 ** retry) + random.uniform(0, 1)
+
+
+class RateGate:
+    """A cooldown shared by a run's parallel clients, with staggered recovery."""
+    def __init__(self):
+        self.lock = Lock()
+        self.until = 0.0
+        self.paced = False
+
+    def defer(self, seconds):
+        with self.lock:
+            self.until = max(self.until, time.monotonic() + seconds)
+            self.paced = True
+
+    def wait(self, deadline, check_cancelled, on_wait):
+        announced = False
+        while True:
+            check_cancelled()
+            with self.lock:
+                now = time.monotonic()
+                delay = self.until - now
+                if delay <= 0:
+                    if self.paced:
+                        self.until = now + .5
+                    return
+            if now + delay > deadline:
+                raise RateLimitExceeded("Provider cooldown exceeds the five-minute retry window. Resume later; no early retry was sent.")
+            if not announced:
+                on_wait({"kind": "provider_wait", "seconds": round(delay, 2)})
+                announced = True
+            time.sleep(min(delay, .25))
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # Never forward a bearer token to an unexpected host.
@@ -63,23 +128,34 @@ class Client:
         self.model, self.api_key, self.budget = model, api_key, budget
         self.timeout, self.max_tokens = timeout, max_tokens
         self.opener = urllib.request.build_opener(NoRedirect())
+        self.rate_gate = RateGate()
+        self.check_cancelled = lambda: None
+        self.on_event = lambda event: None
 
     def fork(self) -> "Client":
         """Independent HTTP transport and conversations, one shared request budget."""
-        return Client(self.url.removesuffix("/chat/completions"), self.model, self.api_key,
-                      self.budget, self.timeout, self.max_tokens)
+        child = Client(self.url.removesuffix("/chat/completions"), self.model, self.api_key,
+                       self.budget, self.timeout, self.max_tokens)
+        child.rate_gate = self.rate_gate
+        return child
 
     def complete(self, messages: list[dict[str, Any]], *, tools: list[dict] | None = None) -> dict[str, Any]:
         body = {"model": self.model, "messages": messages, self.token_parameter: self.max_tokens}
         if self.native_tools and tools:
             body.update(tools=tools, tool_choice="required", parallel_tool_calls=False)
         payload = json.dumps(body).encode()
-        for retry in range(3):
+        deadline = time.monotonic() + 300
+        for retry in range(7):
+            if self.budget.used >= self.budget.limit:
+                raise BudgetExceeded(f"LLM request budget ({self.budget.limit}) exhausted.")
+            self.rate_gate.wait(deadline, self.check_cancelled, self.on_event)
+            self.check_cancelled()
             self.budget.reserve()  # Atomic across workers; retries count too.
             request = urllib.request.Request(self.url, data=payload, headers={
                 "Authorization": "Bearer " + self.api_key,
                 "Content-Type": "application/json",
             })
+            self.on_event({"kind": "provider_request", "retry": retry})
             try:
                 with self.opener.open(request, timeout=self.timeout) as response:
                     data = json.loads(response.read(2_000_000))
@@ -114,8 +190,29 @@ class Client:
                 result.pop("_native_call_id", None)
                 return result
             except urllib.error.HTTPError as exc:
-                if exc.code in {429, 500, 502, 503, 504} and retry < 2:
-                    time.sleep(2 ** retry)
+                # Inspect only machine-readable error codes; never log raw error bodies.
+                try:
+                    error = json.loads(exc.read(65536)).get("error", {})
+                    quota = any(error.get(field) in {
+                        "insufficient_quota", "credit_balance_exhausted",
+                        "organization_spend_limit_exceeded", "project_spend_limit_exceeded",
+                        "organization_usage_limit_exceeded", "billing_hard_limit_reached",
+                    } for field in ("code", "type"))
+                except (ValueError, TypeError, AttributeError):
+                    quota = False
+                finally:
+                    exc.close()
+                if exc.code == 429 and quota:
+                    raise ProviderError("LLM quota or billing limit reached (HTTP 429). Update provider credits or limits before resuming; automatic retries cannot resolve this.") from None
+                if exc.code in {429, 500, 502, 503, 504}:
+                    delay = retry_delay(exc.headers, retry)
+                    self.rate_gate.defer(delay)
+                    if retry >= 6 or time.monotonic() + delay > deadline:
+                        if exc.code == 429:
+                            raise RateLimitExceeded("Provider rate limit (HTTP 429) persists beyond the retry limit. Resume later or reduce workers/request size.") from None
+                        raise ProviderError(f"LLM service unavailable (HTTP {exc.code}) after bounded retries. Resume later.") from None
+                    self.on_event({"kind": "provider_retry", "status": exc.code,
+                                   "retry": retry + 1, "max_retries": 6, "seconds": round(delay, 2)})
                     continue
                 # Error bodies may echo credentials or private input; omit them.
                 raise ProviderError(f"LLM endpoint returned HTTP {exc.code}. Check endpoint, model, key and quota.") from None

@@ -94,3 +94,27 @@ class ProtocolTests(unittest.TestCase):
         engine = self.engine([{}, {}, {'tool': 'list_files', 'args': {}}, {}, {}, {'summary': 'Done'}])
         self.assertEqual(engine.role('coder', {}), {'summary': 'Done'})
         self.assertEqual(engine.client.budget.used, 6)
+
+    def test_context_snapshots_match_model_input_and_redact_secret(self):
+        self.store.secret = 'private-example-key'
+        engine = self.engine([
+            {'tool': 'read_file', 'args': {'path': 'contract.txt'}},
+            {'approved': True, 'reason': 'Contract matches'},
+        ])
+        (self.root / 'contract.txt').write_text('Shared shape: id, title')
+        context = {'attempt': 2, 'goal': 'private-example-key',
+                   'proposal': {'approach': 'Share id and title'},
+                   'recent_history': [{'attempt': 1, 'lesson': 'Fix shape mismatch'}]}
+        engine.role('critic', context)
+        raw = (self.root / 'events.jsonl').read_text()
+        self.assertNotIn('private-example-key', raw)
+        snapshots = [e for e in map(json.loads, raw.splitlines()) if e['kind'] == 'agent_context']
+        self.assertEqual(len(snapshots), 2)
+        for index, event in enumerate(snapshots):
+            self.assertEqual(event['messages'], self.store.redact(engine.client.messages[index]))
+            self.assertEqual(event['attempt'], 2)
+            self.assertEqual(event['request_number'], index + 1)
+            self.assertEqual(event['run_id'], self.root.name)
+        self.assertIn('Planner', snapshots[0]['sources']['proposal'])
+        self.assertIn('Shared shape', snapshots[1]['messages'][-1]['content'])
+        self.assertIn('Fix shape mismatch', snapshots[1]['messages'][1]['content'])

@@ -14,6 +14,8 @@ let selected = null,
   running = false,
   polling = false,
   selectedEvent = null,
+  selectedAttempt = null,
+  renderedAttempt = null,
   knownAgents = [],
   folder = "";
 async function api(path, body) {
@@ -148,6 +150,253 @@ function inspect(title, sections) {
     $("detail").append(section);
   }
 }
+const contextPreferences = new Map();
+function contextGroup(parent, title, description) {
+  const group = node("section", undefined, "context-group");
+  group.append(node("h4", title), node("p", description, "muted small"));
+  parent.append(group);
+  return group;
+}
+function searchableContext(section, preference) {
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Search context, sources, files…";
+  search.setAttribute("aria-label", "Search context");
+  search.value = preference.query || "";
+  const count = node("p", "", "muted small");
+  count.setAttribute("aria-live", "polite");
+  function filter() {
+    preference.query = search.value;
+    const query = search.value.trim().toLocaleLowerCase();
+    const cards = [...section.querySelectorAll(".context-card")];
+    let matches = 0;
+    cards.forEach((card) => {
+      card.hidden =
+        !!query && !card.textContent.toLocaleLowerCase().includes(query);
+      if (!card.hidden) matches++;
+      if (query) card.open = !card.hidden;
+    });
+    count.textContent = query
+      ? `${matches} of ${cards.length} context cards match in this request`
+      : `${cards.length} context cards · search includes collapsed contents`;
+    section.querySelectorAll(".context-group").forEach((group) => {
+      group.hidden =
+        !!query &&
+        ![...group.querySelectorAll(".context-card")].some(
+          (card) => !card.hidden,
+        );
+    });
+  }
+  search.oninput = filter;
+  section.querySelector("h3").after(search, count);
+  filter();
+  return filter;
+}
+function contextBrowser(id, attempt) {
+  const key = `${selected}:${attempt}:${id}`;
+  if (!contextPreferences.has(key)) contextPreferences.set(key, {});
+  const preference = contextPreferences.get(key);
+  const snapshots = events.filter(
+    (e) =>
+      e.kind === "agent_context" && e.agent_id === id && e.attempt === attempt,
+  );
+  const section = node("section", undefined, "context-browser detail-section");
+  section.append(node("h3", "Context supplied to this agent"));
+  if (!snapshots.length) {
+    const trace = events.filter((e) => (e.attempt ?? e._attempt) === attempt);
+    const matching = trace.filter((e) => e.agent_id === id);
+    const invoked = matching.some((e) => e.kind === "role_started");
+    section.append(
+      node(
+        "p",
+        invoked
+          ? "This agent received context, but this server did not record exact input snapshots. The records below are recovered from saved events, not a reconstruction of the full prompt. Restart the updated server before your next run to capture exact inputs."
+          : "This agent has not started in this attempt. No model input has been sent yet.",
+        "muted",
+      ),
+    );
+    section.append(
+      node("p", `Run ${selected} · ${id} · Attempt ${attempt ?? "unknown"}`),
+    );
+    if (invoked) {
+      const recovered = node("div", undefined, "context-pages");
+      let group = contextGroup(
+        recovered,
+        "Initial inputs · recovered",
+        "Known inputs supplied when this agent started; exact prompt unavailable.",
+      );
+      function card(title, source, value) {
+        if (value === undefined) return;
+        const d = document.createElement("details");
+        d.className = "context-card";
+        d.append(
+          node("summary", title),
+          node("p", "Source: " + source, "muted small"),
+          readable(value, title),
+        );
+        group.append(d);
+      }
+      const history = state?.history?.find((h) => h.attempt === attempt);
+      const planner = trace.findLast(
+        (e) =>
+          e.agent_id === "planner" &&
+          e.kind === "role_reply" &&
+          (e.reply?.final || e.reply?.title),
+      );
+      const plan = history?.proposal || planner?.reply?.final || planner?.reply;
+      if (id !== "planner")
+        card(
+          "Planner proposal / shared interfaces",
+          "Saved planner output for this attempt",
+          plan,
+        );
+      const worker = matching.find((e) => e.kind === "worker_started");
+      card("Assigned task", "Worker dispatch event", worker?.task);
+      card("Workspace", "Worker dispatch event", worker?.workspace);
+      card(
+        "Earlier loop feedback",
+        "Saved attempt history (exact prompt selection unavailable)",
+        state?.history
+          ?.filter((h) => h.attempt < attempt)
+          .map((h) => ({
+            attempt: h.attempt,
+            outcome: h.outcome,
+            lesson: h.lesson,
+          })),
+      );
+      group = contextGroup(
+        recovered,
+        "Accumulated during this agent’s work",
+        "Recorded results produced by tool execution during this invocation.",
+      );
+      let call;
+      for (const e of matching) {
+        if (e.kind === "role_reply") call = e.reply;
+        if (e.kind === "tool_result")
+          card(
+            `Tool result · ${call?.tool || "tool"}${call?.args?.path ? " · " + call.args.path : ""}`,
+            "Recorded workspace tool result; exact model-side truncation unavailable",
+            e.result,
+          );
+      }
+      section.append(recovered);
+    }
+    searchableContext(section, preference);
+    return section;
+  }
+  const picker = document.createElement("select");
+  picker.setAttribute("aria-label", "Agent context request");
+  snapshots.forEach((e, i) => {
+    const option = document.createElement("option");
+    option.value = i;
+    option.textContent = `Loop ${e.attempt ?? "unknown"} · Request ${e.request_number}`;
+    picker.append(option);
+  });
+  const body = node("div", undefined, "context-pages");
+  let applySearch = () => {};
+  function show() {
+    const e = snapshots[Number(picker.value)];
+    body.replaceChildren(
+      node(
+        "p",
+        `Run ${e.run_id} · ${e.agent_id} · Loop ${e.attempt ?? "unknown"}`,
+      ),
+      node("p", `Workspace: ${e.workspace}`, "small"),
+      node("p", e.note, "muted small"),
+    );
+    const initial = contextGroup(
+      body,
+      "Initial inputs",
+      "Supplied when this agent started: instructions, assignment, and any context passed from earlier agents or attempts.",
+    );
+    const generated = contextGroup(
+      body,
+      "Accumulated during this agent’s work",
+      "This agent’s earlier messages, tool results, and corrections still included in the selected request.",
+    );
+    let group = initial;
+    function card(title, source, value) {
+      const d = document.createElement("details");
+      d.className = "context-card";
+      d.append(
+        node("summary", title),
+        node("p", "Source: " + source, "muted small"),
+        readable(value, title),
+      );
+      group.append(d);
+    }
+    e.messages.forEach((m, i) => {
+      if (i === 0)
+        card(
+          "System instructions",
+          "GoalForge protocol and role instructions",
+          m.content,
+        );
+      else if (i === 1) {
+        let context;
+        try {
+          context = JSON.parse(m.content);
+        } catch {
+          context = { context: m.content };
+        }
+        Object.entries(context).forEach(([key, value]) =>
+          card(
+            humanLabel(key),
+            e.sources[key] || "Orchestrator context",
+            value,
+          ),
+        );
+      } else {
+        group = generated;
+        let value = m.content;
+        if (m.tool_calls)
+          value = m.tool_calls.map((c) => {
+            let args = c.function.arguments;
+            try {
+              args = JSON.parse(args);
+            } catch {}
+            return { tool: c.function.name, arguments: args };
+          });
+        else if (typeof value === "string") {
+          try {
+            value = JSON.parse(
+              value.replace(/^Tool result \(untrusted\):\n/, ""),
+            );
+          } catch {}
+        }
+        card(
+          `Conversation message ${i - 1} · ${m.role}`,
+          m.role === "assistant"
+            ? "Earlier response from this agent"
+            : m.role === "tool" || String(m.content).startsWith("Tool result")
+              ? "Workspace tool execution returned to this agent"
+              : "Orchestrator validation / correction",
+          value,
+        );
+      }
+    });
+    group = initial;
+    if (e.tool_definitions?.length)
+      card(
+        "Available tools",
+        "GoalForge native tool schemas",
+        e.tool_definitions,
+      );
+    applySearch();
+  }
+  picker.value =
+    preference.request !== undefined
+      ? Math.min(preference.request, snapshots.length - 1)
+      : snapshots.length - 1;
+  picker.onchange = () => {
+    preference.request = Number(picker.value);
+    show();
+  };
+  show();
+  section.append(picker, body);
+  applySearch = searchableContext(section, preference);
+  return section;
+}
 let selectedAgent = null;
 function inspectAgent(id, title, trace, status, detail) {
   const matching = trace.filter((e) => e.agent_id === id);
@@ -227,7 +476,14 @@ function inspectAgent(id, title, trace, status, detail) {
     sections["Recorded explanation"] =
       "No final explanation yet. The activity list shows the actions recorded so far.";
   if (!matching.length && detail) Object.assign(sections, detail);
+  sections["Run / loop"] = `${selected} · Loop ${viewedAttempt() ?? "unknown"}`;
+  // Include snapshot count in the signature so live context stays current.
+  sections["Context requests recorded"] = matching.filter(
+    (e) => e.kind === "agent_context",
+  ).length;
   inspect(title, sections);
+  if (!$("detail").querySelector(".context-browser"))
+    $("detail").prepend(contextBrowser(id, viewedAttempt()));
   if (report?.patch && id.startsWith("coder-")) {
     const patchButton = button(
       "View this worker’s diff",
@@ -273,6 +529,28 @@ function inspectEvent(index) {
       attempt: event.attempt,
     },
   };
+  if (event.kind === "agent_context") {
+    inspect("Agent input context", {
+      Run: event.run_id,
+      Agent: event.agent_id,
+      Loop: event.attempt,
+    });
+    $("detail").querySelector(".context-browser")?.remove();
+    const browser = contextBrowser(event.agent_id, event.attempt);
+    $("detail").prepend(browser);
+    const picker = browser.querySelector("select");
+    if (picker) {
+      const snapshots = events.filter(
+        (e) =>
+          e.kind === "agent_context" &&
+          e.agent_id === event.agent_id &&
+          e.attempt === event.attempt,
+      );
+      picker.value = snapshots.indexOf(event);
+      picker.onchange();
+    }
+    return;
+  }
   if (event.reply) {
     const reply = cleanReply(event.reply);
     sections[reply.final ? "Decision / explanation" : "Tool request"] =
@@ -300,6 +578,12 @@ function label(e) {
   }
   return (
     {
+      agent_context: `Context supplied · request ${e.request_number}`,
+      provider_wait: `Waiting for shared API cooldown · ${e.seconds}s`,
+      provider_retry: `API ${e.status} · retry ${e.retry}/${e.max_retries} after ${e.seconds}s`,
+      provider_request: e.retry
+        ? `Retrying API request (${e.retry})`
+        : "Calling model",
       role_started: "Started",
       role_finished: "Finished",
       worker_started: "Task assigned",
@@ -315,11 +599,77 @@ function label(e) {
     }[e.kind] || e.kind.replaceAll("_", " ")
   );
 }
+function viewedAttempt() {
+  return selectedAttempt ?? state?.attempt ?? 0;
+}
+function chooseAttempt(value) {
+  selectedAttempt = value;
+  selectedEvent = null;
+  selectedAgent = null;
+  inspectorSignature = "";
+  $("filter").value = "";
+  inspect("Attempt " + viewedAttempt(), {
+    Status: "Select an agent or action to inspect this attempt.",
+  });
+  renderActivity();
+}
+function renderAttemptNavigation() {
+  const nav = $("attempt-navigation");
+  const attempts = [
+    ...new Set([
+      0,
+      state?.attempt ?? 0,
+      ...events.map((e) => e.attempt ?? e._attempt ?? 0),
+      ...(state?.history || []).map((h) => h.attempt),
+    ]),
+  ].sort((a, b) => a - b);
+  const signature = JSON.stringify([attempts, selectedAttempt, state?.attempt]);
+  if (nav.dataset.signature === signature) return;
+  nav.dataset.signature = signature;
+  nav.replaceChildren();
+  const picker = document.createElement("select");
+  picker.id = "attempt-select";
+  picker.setAttribute("aria-label", "View attempt");
+  picker.append(new Option("Follow latest attempt", "latest"));
+  for (const attempt of attempts)
+    picker.append(
+      new Option(
+        attempt === 0 ? "Baseline" : `Attempt ${attempt}`,
+        String(attempt),
+      ),
+    );
+  picker.value = selectedAttempt === null ? "latest" : String(selectedAttempt);
+  picker.onchange = () =>
+    chooseAttempt(picker.value === "latest" ? null : Number(picker.value));
+  const previous = button("← Previous", () =>
+    chooseAttempt(attempts[attempts.indexOf(viewedAttempt()) - 1]),
+  );
+  previous.disabled = attempts.indexOf(viewedAttempt()) <= 0;
+  const next = button("Next →", () =>
+    chooseAttempt(attempts[attempts.indexOf(viewedAttempt()) + 1]),
+  );
+  next.disabled = attempts.indexOf(viewedAttempt()) >= attempts.length - 1;
+  nav.append(previous, picker, next);
+}
 function renderActivity() {
+  if (renderedAttempt !== viewedAttempt()) {
+    renderedAttempt = viewedAttempt();
+    selectedAgent = null;
+    selectedEvent = null;
+    inspect("Attempt " + viewedAttempt(), {
+      Status: "Select an agent or action to inspect this attempt.",
+    });
+  }
+  renderAttemptNavigation();
   const filter = $("filter").value;
   const visible = events
     .map((e, i) => ({ e, i }))
-    .filter(({ e }) => e.kind !== "log" && (!filter || e.agent_id === filter));
+    .filter(
+      ({ e }) =>
+        (e.attempt ?? e._attempt) === viewedAttempt() &&
+        e.kind !== "log" &&
+        (!filter || e.agent_id === filter),
+    );
   const box = $("timeline");
   const bottom = box.scrollHeight - box.scrollTop - box.clientHeight < 70;
   box.replaceChildren();
@@ -355,12 +705,10 @@ function renderActivity() {
 function renderGraph() {
   const host = $("agents");
   host.replaceChildren();
-  // Restrict the graph to the latest attempt, rather than mixing old workers
-  // and decisions with a newly resumed plan.
-  const start = events.findLastIndex(
-    (e) => e.kind === "role_started" && e.role === "planner",
+  const trace = events.filter(
+    (e) => (e.attempt ?? e._attempt) === viewedAttempt(),
   );
-  const trace = start >= 0 ? events.slice(start) : [];
+  const liveAttempt = running && viewedAttempt() === state?.attempt;
   const dispatch = trace.find((e) => e.kind === "dispatch");
   const workerIds = dispatch
     ? dispatch.tasks.map((_, i) => "coder-" + (i + 1))
@@ -396,13 +744,10 @@ function renderGraph() {
     concurrent += delta;
     peak = Math.max(peak, concurrent);
   }
-  const active = running ? ends.size : 0;
+  const active = liveAttempt ? ends.size : 0;
   const heading = node("div", undefined, "graph-heading");
   heading.append(
-    node(
-      "strong",
-      "Agent flow · attempt " + (trace[0]?.attempt || state?.attempt || 0),
-    ),
+    node("strong", "Agent flow · attempt " + viewedAttempt()),
     node(
       "span",
       active > 1
@@ -414,6 +759,19 @@ function renderGraph() {
     ),
   );
   host.append(heading);
+  const outcome = state?.history?.findLast(
+    (h) => h.attempt === viewedAttempt(),
+  );
+  if (outcome)
+    host.append(
+      node(
+        "p",
+        `${outcome.outcome}: ${outcome.lesson || ""}`,
+        "attempt-outcome",
+      ),
+    );
+  if (state?.last_error && viewedAttempt() === state.attempt)
+    host.append(node("p", state.last_error, "attempt-outcome"));
   const scroll = node("div", undefined, "graph-scroll");
   const canvas = node("div", undefined, "graph-canvas");
   canvas.style.width = width + "px";
@@ -448,7 +806,7 @@ function renderGraph() {
       (last.kind === "worker_failed" ||
         (last.kind === "check" &&
           (last.result.returncode !== 0 || last.result.timed_out)));
-    const isActive = running && last && !finished && !failed;
+    const isActive = liveAttempt && last && !finished && !failed;
     const status = failed
       ? "Failed"
       : finished
@@ -557,6 +915,8 @@ async function listRuns() {
 }
 async function selectRun(id) {
   selected = id;
+  renderedAttempt = null;
+  selectedAttempt = null;
   cursor = 0;
   events = [];
   selectedEvent = null;
@@ -581,7 +941,11 @@ async function poll() {
     state = data.state;
     running = data.running;
     cursor = data.cursor;
-    events.push(...data.events);
+    let eventAttempt = events.at(-1)?._attempt ?? 0;
+    for (const e of data.events) {
+      eventAttempt = e.attempt ?? eventAttempt;
+      events.push({ ...e, _attempt: eventAttempt });
+    }
     $("title").textContent = state.goal;
     $("status").textContent = data.stopping
       ? "Pausing…"
@@ -631,6 +995,7 @@ async function poll() {
 }
 $("new").onclick = () => {
   selected = null;
+  selectedAttempt = null;
   state = null;
   events = [];
   selectedEvent = null;
@@ -821,6 +1186,7 @@ $("folder-cancel").onclick = () => $("folder-dialog").close();
 (async () => {
   try {
     const config = await api("config");
+    $("server-update").hidden = config.context_capture_version >= 1;
     $("repo").value = config.repo;
     $("model").value = config.model;
     if (!config.key_configured)
@@ -837,3 +1203,22 @@ $("folder-cancel").onclick = () => $("folder-dialog").close();
 })();
 setInterval(() => poll(), 1000);
 setInterval(() => listRuns().catch(() => {}), 5000);
+
+function expandInspector(expanded) {
+  document.body.classList.toggle("inspector-expanded", expanded);
+  $("expand-inspector").textContent = expanded
+    ? "Restore sidebar ↙"
+    : "Expand panel ↗";
+  $("expand-inspector").setAttribute("aria-expanded", String(expanded));
+}
+$("expand-inspector").onclick = () =>
+  expandInspector(!document.body.classList.contains("inspector-expanded"));
+document.addEventListener("keydown", (event) => {
+  if (
+    event.key === "Escape" &&
+    document.body.classList.contains("inspector-expanded")
+  ) {
+    expandInspector(false);
+    $("expand-inspector").focus();
+  }
+});

@@ -4,10 +4,10 @@ import argparse
 import getpass
 import json
 from pathlib import Path
-import shlex
 import sys
 from threading import RLock
 
+from .verification import verification_commands
 from .config import settings
 from .engine import Engine
 from .provider import Budget, Client
@@ -35,7 +35,7 @@ def parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="Start a goal in an isolated Git worktree")
     run.add_argument("goal", help="Concrete coding goal, including expected behavior")
     run.add_argument("--repo", type=Path, default=Path.cwd())
-    run.add_argument("--check", action="append", required=True, help="Required verification command; repeat for multiple checks")
+    run.add_argument("--check", action="append", default=[], help="Verification command; repeat for multiple checks (default: Python unittest discovery in tests/)")
     run.add_argument("--protect", action="append", default=[], help="Repository-relative path or glob which must not change")
     run.add_argument("--directive", type=Path, help="Text file containing coding conventions and constraints")
     for command in (run, sub.add_parser("resume", help="Continue from the last accepted checkpoint")):
@@ -59,11 +59,14 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--runs-dir", type=Path, default=None)
     ls = sub.add_parser("list", help="List saved runs")
     ls.add_argument("--runs-dir", type=Path, default=None)
-    web = sub.add_parser("serve", help="Open the local web UI for goals and live agent activity")
+    web = sub.add_parser("serve", help="Serve the local web UI for goals and live agent activity")
     web.add_argument("repo", nargs="?", type=Path, default=Path.cwd())
     web.add_argument("--runs-dir", type=Path, default=None)
     web.add_argument("--port", type=int, default=8765)
-    web.add_argument("--no-open", action="store_true", help="Print the URL without opening a browser")
+    browser = web.add_mutually_exclusive_group()
+    browser.add_argument("--open", dest="open_browser", action="store_true", help="Open the printed URL in your browser")
+    browser.add_argument("--no-open", dest="open_browser", action="store_false", help="Print the URL without opening a browser (default)")
+    web.set_defaults(open_browser=False)
     for command in sub.choices.values():
         command.add_argument("--env-file", type=Path,
                              help="Configuration file (default: .env in the current directory)")
@@ -101,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
             args.runs_dir = Path(config.get("GOALFORGE_HOME") or str(Path.home() / ".goalforge")) / "runs"
         if args.command == "serve":
             from .web import serve
-            return serve(args.repo, args.runs_dir, config, args.port, not args.no_open)
+            return serve(args.repo, args.runs_dir, config, args.port, args.open_browser)
         if args.command == "list":
             for path in sorted(args.runs_dir.glob("*/state.json")):
                 state = json.loads(path.read_text(encoding="utf-8"))
@@ -132,9 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         if store is None:
             if not args.goal.strip() or len(args.goal) > 16000:
                 raise ValueError("Provide a nonempty goal under 16,000 characters")
-            checks = [shlex.split(c) for c in args.check]
-            if any(not c for c in checks):
-                raise ValueError("Verification commands cannot be empty")
+            checks = verification_commands(args.check)
             if any(Path(p).is_absolute() or ".." in Path(p).parts for p in args.protect):
                 raise ValueError("Protected paths must be relative to the repository")
             directive = args.directive.read_text(encoding="utf-8") if args.directive else "Follow existing project conventions. Make focused, maintainable changes."

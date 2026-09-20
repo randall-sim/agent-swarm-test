@@ -143,7 +143,7 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("max_tokens", body)
 
     def test_retry_obeys_budget(self):
-        with server([], status=429) as (url, seen), patch("goalforge.provider.time.sleep"):
+        with server([], status=429) as (url, seen), patch("goalforge.provider.RateGate.wait"):
             client = Client(url, "test", "test-key", Budget(2))
             with self.assertRaises(BudgetExceeded):
                 client.complete([])
@@ -199,6 +199,44 @@ class EngineTests(unittest.TestCase):
         state = self.run_engine(replies(accept=False))
         self.assertEqual(state["history"][-1]["outcome"], "reverted")
         self.assertEqual(state["accepted_commit"], self.initial)
+
+    def test_planning_stall_pauses_early_and_can_resume(self):
+        responses = []
+        for i in range(8):
+            responses += [proposal(f"Plan {i}"), {"final": {"approved": False, "reason": "Specify shared errors"}}]
+        state = self.run_engine(responses, iterations=8)
+        self.assertEqual(state["status"], "paused")
+        self.assertEqual(state["attempt"], 3)
+        self.assertEqual(state["usage"]["requests"], 6)
+        self.assertIn("Planning stalled", state["last_error"])
+        self.assertEqual(state["accepted_commit"], self.initial)
+        state = self.run_engine(replies())
+        self.assertEqual(state["status"], "complete")
+        self.assertNotIn("last_error", state)
+
+    def test_review_feedback_reaches_next_plan_with_checkpoint_restored(self):
+        first = replies(accept=False)
+        second = replies()
+        second[0] = proposal("Revised plan addressing review")
+        state = self.run_engine(first + second, iterations=2)
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual([h["outcome"] for h in state["history"]], ["reverted", "kept"])
+        events = [json.loads(line) for line in (self.store.root / "events.jsonl").read_text().splitlines()]
+        planner = next(e for e in events if e["kind"] == "agent_context" and e["role"] == "planner" and e["attempt"] == 2)
+        context = json.loads(planner["messages"][1]["content"])
+        self.assertEqual(context["recent_history"][0]["feedback_source"], "reviewer / execution")
+        self.assertEqual(context["recent_history"][0]["lesson"], "The expected value is two")
+        critic = next(e for e in events if e["kind"] == "agent_context" and e["role"] == "critic")
+        self.assertIn("NEVER reject solely", critic["messages"][0]["content"])
+        self.assertIn("Pre-implementation", json.loads(critic["messages"][1]["content"])["phase"])
+
+    def test_rate_limit_exhaustion_pauses_without_accepting_changes(self):
+        from goalforge.provider import RateLimitExceeded
+        with patch.object(ScriptedClient, "complete", side_effect=RateLimitExceeded("Resume later")):
+            state = self.run_engine([])
+        self.assertEqual(state["status"], "paused")
+        self.assertEqual(state["accepted_commit"], self.initial)
+        self.assertEqual(state["last_error"], "Resume later")
 
     def test_budget_rollback_and_resume(self):
         state = self.run_engine(replies(), limit=3)

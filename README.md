@@ -41,7 +41,7 @@ source .venv/bin/activate
 goalforge serve /path/to/your/project
 ```
 
-Or, without activating the environment, run `.venv/bin/python -m goalforge serve /path/to/your/project` from the GoalForge directory. The server opens your browser and prints its local URL. Use `--no-open` to copy the URL yourself, or `--port 8766` if the default port is busy. In WSL, paste the printed URL into your Windows browser if automatic opening is unavailable.
+Or, without activating the environment, run `.venv/bin/python -m goalforge serve /path/to/your/project` from the GoalForge directory. The server prints its local URL without opening a browser. Open that link yourself, or use `--open` to launch your browser automatically. `--no-open` remains supported. Use `--port 8766` if the default port is busy. In WSL, paste the printed URL into your Windows browser.
 
 The server reads `.env` from the directory where you launch it. To launch from elsewhere, pass `--env-file /path/to/goalforge/.env`. Your API key stays on the Python server; the browser receives only a flag indicating whether it is configured. Restart the server after editing `.env`.
 
@@ -352,3 +352,118 @@ examples/
 To extend it, add a provider adapter implementing `complete(messages, tools=...) -> dict`, `fork()` for a worker client, and a shared thread-safe `budget` object, add tools in `Workspace.execute`, or customize the role prompts and acceptance policy in `engine.py`.
 
 MIT licensed. The paper is credited as architectural inspiration; no paper code or production artifacts are bundled.
+
+## Guided demo preparation
+
+From the project folder, run:
+
+```sh
+.venv/bin/python examples/prepare_demo.py
+```
+
+The wizard lists scenarios with descriptions, lets you choose one, asks for a new
+folder name, and sets the suggested coding worker count. Everything is prepared
+under `demos/<name>/` as a separate, clean Git repository. Existing directories
+are never overwritten. Preparation is offline and makes no model requests.
+
+- **utilities**: the original three independent functions, for a quick parallel run.
+- **taskboard**: server-rendered HTML frontend, request handler and SQLite storage.
+  Workers must agree on adapter methods, task shapes, validation and escaping.
+- **reservations**: inventory frontend, API and transactional SQLite storage.
+  Exercises durable idempotency, concurrent reservations, rollback and errors
+  crossing layer boundaries.
+
+```sh
+# List choices, or prepare without interactive prompts:
+.venv/bin/python examples/prepare_demo.py --list
+.venv/bin/python examples/prepare_demo.py --demo reservations --name stock-loop --workers 3
+```
+
+Each folder contains `DEMO.md` with a ready-to-run CLI command and the goal,
+check command, protected paths, worker count and budgets to enter in the web UI.
+`demo.json` stores those settings for reference; the UI does not import it automatically.
+The larger demos use a framework-independent request handler and server-rendered
+HTML functions, so they need no Node tooling, web framework or database service.
+They are coding exercises, not independently hosted browser applications.
+
+Baseline acceptance checks intentionally fail. The planner must define the shared
+internal contract before dispatch; workers implement separate modules against it.
+The reviewer evaluates the combined implementation. Rejections roll back edits and
+send lessons into the next loop; accepted incomplete work can continue from its
+checkpoint. Multiple loops are possible, not guaranteed: a correct implementation
+can finish on its first attempt. The reservation demo is the harder stress test.
+The existing `examples/run_parallel_demo.py` command remains available.
+
+## Inspect agent input context
+
+For new runs, click an agent node and open **Context supplied to this agent** in
+the sidebar. Select a model request, then expand the scrollable cards for the goal,
+system instructions, planner proposal/shared interfaces, worker assignment,
+previous-loop lessons, baseline results, review diff, check results or conversation
+messages. Each card names its source; the view labels the run, loop, request and
+workspace. Click a historical **Context supplied** activity event to inspect an
+older loop. This shows supplied inputs and explicit agent outputs, not hidden reasoning.
+
+Snapshots are `agent_context` records in the run's `events.jsonl`, captured immediately
+before each model call with the configured API secret redacted. They reflect context
+pruning and truncated tool output as actually supplied by the engine, and include
+native tool definitions when enabled. Provider-side processing is not recorded.
+Snapshots repeat conversation context, so logs can grow substantially and contain
+repository source and command output; treat them as local project data. Older runs
+have no snapshots and are labeled accordingly. Restart your local GoalForge server
+and refresh the page after updating to load this feature.
+
+
+### Browsing attempts and recovering a stalled plan
+
+Use the attempt selector above the graph, or Previous / Next, to inspect any loop
+while the current one continues. Selecting an attempt pins its graph, activity and
+agent inputs; **Follow latest attempt** resumes automatic tracking. Each completed
+attempt shows its outcome and feedback. Baseline checks have their own entry.
+
+Older runs without exact input snapshots show recovered planner assignments and
+recorded tool results, with explicit provenance and an explanation of what is
+unavailable. These records are not claimed to be the full original model prompt.
+If the UI detects an older server process, it displays a restart notice; a browser
+refresh alone does not reload Python code.
+
+The critic approves an implementation **plan**, while the reviewer evaluates the
+**actual implementation** after coding. Placeholders and failing baseline tests
+are not by themselves grounds for rejecting a plan. Parallel plans must specify
+exact shared symbols, method signatures, return shapes and error behavior before
+workers start. After three consecutive pre-coding plan rejections in one execution,
+GoalForge pauses with a planning-stalled explanation instead of consuming every
+remaining attempt. Inspect the feedback, add guidance, and resume when ready.
+
+If verification commands are blank (or CLI `--check` is omitted), GoalForge defaults to
+`<its Python executable> -m unittest discover -s tests -v` in the run workspace.
+Explicit commands replace this default; resumed runs retain their saved checks.
+
+### Context panel controls
+
+Click **Expand panel** to use the full page; **Restore sidebar** or Escape returns
+it to its normal width. Context is split into **Initial inputs** (including any
+planner or prior-attempt feedback supplied when this agent started) and
+**Accumulated during this agent's work** (its messages, tool results and corrections).
+The search box searches card titles, sources and contents, including collapsed
+cards, for the selected request. Matching cards expand automatically. Search text
+and the selected request are retained when the panel updates.
+
+### API throttling and retries
+
+The client shares a cooldown across parallel workers in the same run. Temporary
+HTTP 429 and server-overload responses use `Retry-After` timing when supplied
+(seconds, HTTP date, or `retry-after-ms`); exhausted request/token reset headers
+are a fallback. Otherwise it uses exponential backoff with jitter. Recovery
+requests are spaced at least half a second apart after a cooldown. Already
+in-flight requests cannot be recalled. Cooldowns are local to this run, not
+coordinated with other applications using the same API account.
+
+Each model call allows up to six retries, with a five-minute cooldown/retry window;
+a longer server delay stops automatic retries instead of retrying early. Every
+HTTP attempt counts against the shared request budget. Waiting is cancellable
+with Pause. Retry and wait events appear in the activity list and terminal.
+Persistent temporary rate limits pause the run for later resumption; known
+billing/quota errors stop immediately with an actionable message. No raw provider
+error bodies are logged. An individual in-flight HTTP request still has its own
+request timeout. This follows the [OpenAI rate-limit guidance](https://developers.openai.com/api/docs/guides/rate-limits).

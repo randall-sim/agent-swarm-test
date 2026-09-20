@@ -7,7 +7,7 @@ from threading import Event
 from typing import Callable
 
 from .tool_schemas import definitions
-from .provider import BudgetExceeded, Client, ProviderError
+from .provider import BudgetExceeded, Client, ProviderError, RateLimitExceeded
 from .state import Store, fingerprint, git, rollback
 from .workspace import OUTPUT_LIMIT, Workspace, run_process, sensitive
 from .swarm import PARALLEL_PLANNER, WorkerCancelled, cleanup_workers, implement_parallel, validate_tasks
@@ -35,9 +35,22 @@ ROLES = {
     "planner": '''Inspect the relevant source. Propose one useful implementation step toward the goal.
 Use previous failures to avoid redundant work. Cover the entire goal if small enough, otherwise a
 coherent increment. final fields: title (string), approach (string), acceptance (string).
-The approach must explain what to change; acceptance must explain how to demonstrate correctness.''',
+The approach must explain what to change; acceptance must explain how to demonstrate correctness.
+A reverted attempt leaves NONE of its rejected edits in the workspace. Plan repairs from the current
+accepted checkpoint, using previous review feedback as diagnostic evidence, not as current source.
+Resolve every shared interface in the proposal itself; never delegate choosing incompatible names
+or return shapes to separate workers. If the previous plan was rejected, address each actual plan
+objection explicitly. A complaint that code is not implemented belongs to post-coding review, not
+pre-coding approval: explain the planned implementation instead of waiting for it to already exist.''',
     "critic": '''Review the proposal before execution. Inspect source as needed. Reject vague,
 redundant, infeasible or goal-conflicting work. Do not demand research experiments for normal coding.
+You are the PRE-IMPLEMENTATION PLAN critic, NOT the post-implementation reviewer. Coding workers
+have not run yet. Approve an implementable plan even when source contains placeholders or baseline
+checks fail. NEVER reject solely because the proposed code has not yet been written, interfaces
+have not yet been encoded, or tests do not yet pass. Judge whether following the proposal would
+fix those issues. Reject unresolved shared method names, return shapes, error symbols or ownership
+conflicts, and state the precise missing decisions the planner must make before dispatch.
+The separate reviewer evaluates actual implementation after workers and checks finish.
 final fields: approved (boolean), reason (string).''',
     "coder": '''Implement the approved proposal. Inspect before editing; add appropriate tests.
 Use tools to actually make the changes. Do not merely describe code. Existing user-protected paths
@@ -93,9 +106,27 @@ class Engine:
         self.cancelled = cancelled or Event()
 
     def role(self, name: str, context: dict) -> dict:
+        context = {**context, "phase": {
+            "planner": "Plan changes from the current accepted checkpoint",
+            "critic": "Pre-implementation approval of the proposed plan; no coding has happened in this attempt",
+            "coder": "Implement the approved plan in the assigned workspace",
+            "reviewer": "Post-implementation review of actual changes and check results",
+        }[name]}
         label = self.agent_id or name
         self.emit(f"[{label}] START {name}")
         self.store.event("role_started", agent_id=label, role=name, attempt=context.get("attempt"))
+        if isinstance(self.client, Client):
+            def check_cancelled():
+                if self.cancelled.is_set():
+                    raise WorkerCancelled("Paused by user")
+            def provider_event(event):
+                event = dict(event)
+                kind = event.pop("kind")
+                self.store.event(kind, agent_id=label, role=name, attempt=context.get("attempt"), **event)
+                if kind in {"provider_wait", "provider_retry"}:
+                    self.emit(f"[{label}] {kind.replace('_', ' ')}: {event.get('seconds', 0)}s")
+            self.client.check_cancelled = check_cancelled
+            self.client.on_event = provider_event
         native = getattr(self.client, "native_tools", False)
         protocol = PROTOCOL
         if native:
@@ -145,9 +176,34 @@ class Engine:
             else:
                 messages.append({"role": "user", "content": correction})
 
-        for _ in range(self.steps):
+        sources = {
+            "phase": "Orchestrator role lifecycle (plan approval versus implementation review)",
+            "goal": "User goal and follow-up instructions (saved run state)",
+            "directive": "User directive / run instructions",
+            "attempt": "Orchestrator loop counter",
+            "max_workers": "Run worker configuration",
+            "checks": "User-configured acceptance commands",
+            "protected_paths": "User-configured protected paths",
+            "baseline": "Check output from the initial workspace (last 3,000 characters per check)",
+            "recent_history": "Previous loop outcomes and reviewer/critic lessons (last 12; lessons capped at 2,000 characters)",
+            "file_index": "Current agent workspace file listing (first 500 paths)",
+            "proposal": "Planner output from this loop, including shared interfaces",
+            "assigned_task": "Planner task selected by the orchestrator",
+            "agent_id": "Orchestrator worker identity",
+            "instruction": "Orchestrator file-ownership restrictions",
+            "implementation": "Coding agent summaries from this loop",
+            "diff": "Git staged diff of the combined implementation",
+            "check_results": "Acceptance commands run against the combined implementation",
+        }
+        for request_number in range(1, self.steps + 1):
             if self.cancelled.is_set():
                 raise WorkerCancelled("Paused by user")
+            self.store.event("agent_context", agent_id=label, role=name,
+                             run_id=self.store.root.name, attempt=context.get("attempt"),
+                             request_number=request_number, workspace=str(self.workspace.root),
+                             sources=sources, messages=messages,
+                             tool_definitions=schema if native else [],
+                             note="Recorded immediately before the model call; configured secret redacted. Older tool exchanges may have been pruned to fit the context limit.")
             try:
                 reply = self.client.complete(messages, tools=schema)
             except ProviderError as exc:
@@ -208,8 +264,9 @@ class Engine:
                 "attempt": state["attempt"], "max_workers": self.workers,
                 "checks": state["checks"], "protected_paths": state["protected"],
                 "baseline": [{**r, "output": r["output"][-3000:]} for r in (state["baseline"] or [])],
-                "recent_history": [{"proposal": h.get("proposal"), "outcome": h["outcome"],
-                                    "lesson": h.get("lesson", "")[:2000]} for h in state["history"][-12:]],
+                "recent_history": [{"attempt": h.get("attempt"), "proposal": h.get("proposal"), "outcome": h["outcome"],
+                                    "lesson": h.get("lesson", "")[:2000],
+                                    "feedback_source": "critic (plan approval)" if h.get("critique", {}).get("approved") is False else "reviewer / execution"} for h in state["history"][-12:]],
                 "file_index": self.workspace.files()[:500]}
 
     def execute(self, iterations: int) -> dict:
@@ -230,6 +287,7 @@ class Engine:
                 state.pop("last_error", None)
                 state["status"] = "running"
                 self.store.write(state)
+                rejected_plans = 0
                 for _ in range(iterations):
                     state["attempt"] += 1
                     self.store.write(state)
@@ -251,17 +309,27 @@ class Engine:
                             item.update(outcome="rejected", lesson=critique["reason"])
                         else:
                             self.implement(state, context, item)
+                    rejected_plans = rejected_plans + 1 if item["outcome"] == "rejected" else 0
+                    if rejected_plans >= 3:
+                        state["status"] = "paused"
+                        state["last_error"] = (
+                            "Planning stalled: three consecutive plans were rejected before coding. "
+                            "Review the critic's objections and add guidance before resuming. "
+                            "Last objection: " + item.get("lesson", ""))
+                        self.store.event("planning_stalled", attempt=state["attempt"],
+                                         reason=state["last_error"])
+                        self.emit(state["last_error"])
                     state["history"].append(item)
                     self.store.event("attempt", **item)
                     self.store.write(state)
                     self.emit(f"  {item['outcome'].upper()}: {item.get('lesson', '')}")
-                    if state["status"] == "complete":
+                    if state["status"] in {"complete", "paused"}:
                         break
-                if state["status"] != "complete":
+                if state["status"] == "running":
                     state["status"] = "budget_exhausted"
             except (KeyboardInterrupt, Exception) as exc:
                 # Persist failed execution as knowledge; never retain unreviewed edits.
-                state["status"] = "paused" if isinstance(exc, (KeyboardInterrupt, WorkerCancelled)) else "error"
+                state["status"] = "paused" if isinstance(exc, (KeyboardInterrupt, WorkerCancelled, RateLimitExceeded)) else "error"
                 if isinstance(exc, BudgetExceeded):
                     state["status"] = "budget_exhausted"
                 error = str(exc) or "Interrupted by user"
