@@ -22,7 +22,7 @@ class ContextPolicyTests(unittest.TestCase):
         engine = Engine(self.case.store, fixtures.ScriptedClient(responses), self.case.workspace,
                         emit=lambda _: None)
         self.assertEqual(engine.role('coder', {'attempt': 1})['summary'], 'Finished on step thirty')
-        self.assertEqual(engine.steps, 12)
+        self.assertEqual(engine.steps, 30)
         self.assertEqual(engine.coder_steps, 30)
 
     def accepted(self):

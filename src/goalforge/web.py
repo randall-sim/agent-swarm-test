@@ -129,7 +129,10 @@ class WebApp:
             workers = number('workers', 3, 8)
             calls = number('max_calls', 80, 10000)
             iterations = number('iterations', 5, 100)
-            steps = number('role_steps', 12, 100)
+            # Upgrade the previous saved default; explicit request overrides still win.
+            if 'role_steps' not in data and saved_settings.get('role_steps') == 12:
+                saved_settings = {**saved_settings, 'role_steps': 30}
+            steps = number('role_steps', 30, 100)
             coder_steps = number('coder_steps', 30, 100)
             instructions = str(data.get('instructions', '')).strip()
             if len(instructions) > 16000:

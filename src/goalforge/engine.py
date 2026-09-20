@@ -172,7 +172,7 @@ def decode_reply(name: str, reply: dict) -> tuple[str, dict]:
 
 class Engine:
     def __init__(self, store: Store, client: Client, workspace: Workspace,
-                 steps: int = 12, emit: Callable[[str], None] = print, workers: int = 1,
+                 steps: int = 30, emit: Callable[[str], None] = print, workers: int = 1,
                  agent_id: str | None = None, cancelled: Event | None = None, coder_steps: int = 30):
         self.store, self.client, self.workspace = store, client, workspace
         if not 1 <= workers <= 8:

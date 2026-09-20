@@ -276,7 +276,7 @@ Exit codes: `0` for complete or successful inspection, `2` for an incomplete/bud
 | `--workers` | 3 for new CLI runs | Concurrent coding workers (1–8); planner may use fewer |
 | `--iterations` | 5 | Attempts during this invocation |
 | `--max-calls` | 80 | Shared across all roles and workers, including retries |
-| `--role-steps` | 12 | Responses/tool steps per non-coding role |
+| `--role-steps` | 30 | Responses/tool steps per non-coding role |
 | `--coder-steps` | 30 | Responses/tool steps per coding agent, including parallel workers |
 | `--max-tokens` | 4096 | Requested output-token limit per response |
 | `--timeout` | 120 | Seconds per local command |

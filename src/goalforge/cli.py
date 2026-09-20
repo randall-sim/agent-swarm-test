@@ -51,7 +51,7 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--iterations", type=positive, default=5, help="Maximum attempts this invocation (default 5)")
         command.add_argument("--max-calls", type=positive, default=80, help="Maximum HTTP requests, including retries (default 80)")
         command.add_argument("--coder-steps", type=positive, default=30, help="Maximum steps per coding agent (default 30)")
-        command.add_argument("--role-steps", type=positive, default=12, help="Maximum steps per non-coding role (default 12)")
+        command.add_argument("--role-steps", type=positive, default=30, help="Maximum steps per non-coding role (default 30)")
         command.add_argument("--max-tokens", type=positive, default=4096, help="Maximum output tokens per request")
         command.add_argument("--timeout", type=positive, default=120, help="Timeout per command in seconds")
         command.add_argument("--api-timeout", type=positive, default=90, help="Timeout per HTTP request in seconds")

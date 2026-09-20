@@ -82,10 +82,14 @@ class WebTests(unittest.TestCase):
             self.assertEqual(settings['workers'], 2)
             # A fresh app reads the persisted settings, as after a server restart.
             reopened = WebApp(self.repo, self.root / 'runs', self.app.config)
+            prior = self.app.store(run_id).read()
+            prior['run_settings']['role_steps'] = 12
+            self.app.store(run_id).write(prior)
             reopened.start({'id': run_id}, resume=True)
             reopened.thread.join(10)
             self.assertFalse(reopened.thread.is_alive())
             self.assertEqual(reopened.current_client.budget.limit, 1000)
+            self.assertEqual(reopened.store(run_id).read()['run_settings']['role_steps'], 30)
             self.assertEqual(self.request('/api/resume', {
                 'id': run_id, 'max_calls': 250,
             })[0], 200)
